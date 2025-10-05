@@ -11,55 +11,75 @@ def notion_client() -> Client:
         raise RuntimeError("NOTION_TOKEN missing")
     return Client(auth=NOTION_TOKEN)
 
-def _set_if_empty(props: Dict[str, Any], key: str, value):
+def _is_empty(prop: Dict[str, Any]) -> bool:
+    if "title" in prop:
+        return len(prop.get("title", [])) == 0
+    if "rich_text" in prop:
+        return len(prop.get("rich_text", [])) == 0
+    if "number" in prop:
+        return prop.get("number") is None
+    if "url" in prop:
+        return not prop.get("url")
+    if "select" in prop:
+        return prop.get("select") is None
+    if "date" in prop:
+        return prop.get("date") is None
+    return True
+
+def _encode_value_for(prop: Dict[str, Any], value):
+    # Prop tipine göre doğru JSON şeması döndür
     if value in (None, ""):
-        return
-    if key not in props:
-        return
-    curr = props[key]
-    is_empty = False
-    if "title" in curr:
-        is_empty = len(curr.get("title", [])) == 0
-        if is_empty:
-            curr["title"] = [{"type": "text", "text": {"content": str(value)}}]
-    elif "rich_text" in curr:
-        is_empty = len(curr.get("rich_text", [])) == 0
-        if is_empty:
-            curr["rich_text"] = [{"type": "text", "text": {"content": str(value)}}]
-    elif "number" in curr:
-        is_empty = curr.get("number") in (None,)
-        if is_empty:
-            curr["number"] = int(value)
-    elif "url" in curr:
-        is_empty = curr.get("url") in (None, "")
-        if is_empty:
-            curr["url"] = str(value)
-    elif "select" in curr:
-        is_empty = curr.get("select") in (None,)
-        if is_empty:
-            curr["select"] = {"name": str(value)}
+        return None
+    if "title" in prop:
+        return {"title": [{"type": "text", "text": {"content": str(value)}}]}
+    if "rich_text" in prop:
+        return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
+    if "number" in prop:
+        try:
+            return {"number": int(value)}
+        except Exception:
+            return None
+    if "url" in prop:
+        return {"url": str(value)}
+    if "select" in prop:
+        return {"select": {"name": str(value)}}
+    if "date" in prop:
+        return {"date": {"start": str(value)}}
+    return None
 
 def update_page(page_id: str, data: Dict[str, Any]):
     c = notion_client()
     page = c.pages.retrieve(page_id=page_id)
-    props = page["properties"].copy()
+    props = page["properties"]
 
-    _set_if_empty(props, "Title", data.get("Title"))
-    _set_if_empty(props, "Author", data.get("Author"))
-    _set_if_empty(props, "Translator", data.get("Translator"))
-    _set_if_empty(props, "Publisher", data.get("Publisher"))
-    _set_if_empty(props, "Number of Pages", data.get("Number of Pages"))
-    _set_if_empty(props, "coverURL", data.get("coverURL"))
-    _set_if_empty(props, "Year Published", data.get("Year Published"))
-    _set_if_empty(props, "Language", data.get("Language"))
-    _set_if_empty(props, "Description", data.get("Description"))
+    updates: Dict[str, Any] = {}
 
+    # Şu alanları işlemeye çalış
+    fields = [
+        ("Title", data.get("Title")),
+        ("Author", data.get("Author")),
+        ("Translator", data.get("Translator")),
+        ("Publisher", data.get("Publisher")),
+        ("Number of Pages", data.get("Number of Pages")),
+        ("coverURL", data.get("coverURL")),
+        ("Year Published", data.get("Year Published")),
+        ("Language", data.get("Language")),
+        ("Description", data.get("Description")),
+    ]
+    for key, val in fields:
+        if key in props and _is_empty(props[key]):
+            enc = _encode_value_for(props[key], val)
+            if enc:
+                updates[key] = enc
+
+    # LastSynced -> her zaman güncelle
     if "LastSynced" in props:
-        props["LastSynced"] = {"date": {"start": now_iso()}}
+        updates["LastSynced"] = {"date": {"start": now_iso()}}
 
-    c.pages.update(page_id=page_id, properties=props)
+    if updates:
+        c.pages.update(page_id=page_id, properties=updates)
 
 def query_targets(limit: int = 100):
+    # Filtre yok; URL olmayanları main.py zaten atlıyor
     c = notion_client()
-    # Filtre yok: tüm sayfalar gelir, URL'si olmayanları main.py zaten atlıyor
     return c.databases.query(database_id=DATABASE_ID, page_size=limit)

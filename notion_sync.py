@@ -1,7 +1,7 @@
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from notion_client import Client
-from .utils import now_iso
+from utils import now_iso
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")

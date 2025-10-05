@@ -1,7 +1,7 @@
 import re
 import requests
 from typing import Dict, Optional
-from .utils import soup_from_html, extract_json_ld, textclean, pick_first
+from utils import soup_from_html, extract_json_ld, textclean, pick_first
 
 HEADERS = lambda ua: {"User-Agent": ua or "Mozilla/5.0", "Accept-Language": "tr,en;q=0.8"}
 
@@ -57,8 +57,9 @@ def scrape_1000kitap(url: str, user_agent: Optional[str] = None) -> Dict:
     if tr_a:
         translator = tr_a.get_text(strip=True)
 
-    pages = None
     txt = soup.get_text(" ")
+
+    pages = None
     m = re.search(r"(\d{1,4})\s*(sayfa)\b", txt, flags=re.I)
     if m:
         pages = int(m.group(1))

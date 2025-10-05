@@ -16,9 +16,10 @@ def _og(soup, prop):
 
 def fetch(url: str, user_agent: Optional[str] = None) -> str:
     r = requests.get(url, headers=HEADERS(user_agent), timeout=30)
+    # 403 gibi durumları üst kata bildir
     r.raise_for_status()
     return r.text
-
+    
 def scrape_1000kitap(url: str, user_agent: Optional[str] = None) -> Dict:
     html = fetch(url, user_agent)
     soup = soup_from_html(html)

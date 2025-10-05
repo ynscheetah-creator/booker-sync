@@ -59,12 +59,7 @@ def update_page(page_id: str, data: Dict[str, Any]):
 
     c.pages.update(page_id=page_id, properties=props)
 
-def query_targets(limit: int = 50):
+def query_targets(limit: int = 100):
     c = notion_client()
-    flt = {
-        "or": [
-            {"property": "1000kitapURL", "url": {"is_not_empty": True}},
-            {"property": "goodreadsURL", "url": {"is_not_empty": True}},
-        ]
-    }
-    return c.databases.query(database_id=DATABASE_ID, filter=flt, page_size=limit)
+    # Filtre yok: tüm sayfalar gelir, URL'si olmayanları main.py zaten atlıyor
+    return c.databases.query(database_id=DATABASE_ID, page_size=limit)

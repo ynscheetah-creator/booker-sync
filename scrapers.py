@@ -140,30 +140,43 @@ def scrape_1000kitap(url: str, user_agent: Optional[str] = None) -> Dict:
         "source": "1000kitap",
     }
 
-# ---------- Goodreads (ISBN → Google Books ile doğrulama) ----------
 def scrape_goodreads(url: str, user_agent: Optional[str] = None) -> Dict:
     html = fetch(url, user_agent)
     soup = soup_from_html(html)
     j = extract_json_ld(soup)
 
-    # Temel alanlar
+    # Title
     title = textclean(pick_first(
         _og(soup, "title"),
         j.get("name"),
     ))
 
-    # Author: meta[name='author'] → yoksa sayfadaki /author/ linki
-    author = _meta_name(soup, "author")
+    # Author / Editor – yeni arayüz seçicileri
+    author = None
+    # 1) JSON-LD
+    if isinstance(j.get("author"), dict):
+        author = j["author"].get("name")
+    elif isinstance(j.get("author"), list) and j["author"]:
+        a0 = j["author"][0]
+        if isinstance(a0, dict):
+            author = a0.get("name")
+    # 2) meta[name="author"]
     if not author:
-        a = soup.find("a", href=re.compile(r"/author/"))
-        author = a.get_text(strip=True) if a else None
+        author = _meta_name(soup, "author")
+    # 3) sayfa üzerindeki contributor linkleri
+    if not author:
+        a = soup.select_one('a[href*="/author/"], a.ContributorLink, [data-testid="name"]')
+        if a:
+            author = a.get_text(strip=True)
 
+    # Cover – birkaç olası kaynak
     cover = pick_first(
         _og(soup, "image"),
-        j.get("image"),
+        _meta_prop(soup, "og:image"),
+        j.get("image")
     )
 
-    # ISBN, sayfa, yıl (OpenGraph 'books.*' alanları)
+    # ISBN, pages, year (OpenGraph 'books.*')
     isbn = _meta_prop(soup, "books:isbn")
     pages = None
     mp = _meta_prop(soup, "books:page_count")
@@ -176,7 +189,7 @@ def scrape_goodreads(url: str, user_agent: Optional[str] = None) -> Dict:
 
     desc = _meta_name(soup, "description") or _og(soup, "description") or j.get("description")
 
-    # Dil (varsa JSON-LD'de)
+    # Language
     language = None
     if j.get("inLanguage"):
         language = str(j.get("inLanguage")).upper()
@@ -188,7 +201,7 @@ def scrape_goodreads(url: str, user_agent: Optional[str] = None) -> Dict:
     data = {
         "Title": title,
         "Author": author,
-        "Publisher": None,                     # aşağıda GB ile dolabilir
+        "Publisher": None,
         "Number of Pages": pages,
         "coverURL": cover,
         "Year Published": year,
@@ -197,10 +210,9 @@ def scrape_goodreads(url: str, user_agent: Optional[str] = None) -> Dict:
         "source": "goodreads",
     }
 
-    # ISBN varsa Google Books ile doğrula / zenginleştir
+    # ISBN varsa Google Books ile doğrula/zenginleştir (override)
     gb = googlebooks_by_isbn(isbn, user_agent)
     if gb:
-        # GB verisi olan alanları doldur/override et
         for k, v in gb.items():
             if v:
                 data[k] = v

@@ -1,11 +1,10 @@
 import os
 from typing import Dict
 from dotenv import load_dotenv
-from .scrapers import scrape_1000kitap, scrape_goodreads
-from .notion_sync import query_targets, update_page
+from scrapers import scrape_1000kitap, scrape_goodreads
+from notion_sync import query_targets, update_page
 
 load_dotenv()
-
 UA = os.getenv("USER_AGENT", "Mozilla/5.0")
 
 def detect_and_scrape(url: str) -> Dict:
@@ -25,6 +24,7 @@ def run_once():
         u1000 = props.get("1000kitapURL", {}).get("url") if props.get("1000kitapURL") else None
         ugr = props.get("goodreadsURL", {}).get("url") if props.get("goodreadsURL") else None
 
+        # Title & Author doluysa atla (manuel doldurulmuş olabilir)
         title_filled = bool(props.get("Title", {}).get("title"))
         author_filled = bool(props.get("Author", {}).get("rich_text"))
         if title_filled and author_filled:

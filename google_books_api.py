@@ -2,6 +2,7 @@
 import requests
 from typing import Dict, Optional
 import time
+import re
 
 
 def fetch_from_google_books(title: str = None, author: str = None, isbn: str = None) -> Dict[str, Optional[str]]:
@@ -20,7 +21,7 @@ def fetch_from_google_books(title: str = None, author: str = None, isbn: str = N
     params = {"q": query, "maxResults": 1}
     
     try:
-        time.sleep(0.5)  # Rate limiting
+        time.sleep(0.5)
         res = requests.get(api_url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json()
@@ -40,10 +41,18 @@ def fetch_from_google_books(title: str = None, author: str = None, isbn: str = N
             elif identifier["type"] == "ISBN_13":
                 isbn_13 = identifier["identifier"]
         
-        # Cover URL (daha büyük resim al)
+        # Cover URL (büyük resim)
         cover = None
         if info.get("imageLinks"):
             cover = info["imageLinks"].get("thumbnail", "").replace("zoom=1", "zoom=2")
+        
+        # Description (HTML temizle)
+        description = info.get("description")
+        if description:
+            # HTML taglerini temizle
+            description = re.sub(r'<[^>]+>', '', description)
+            # Notion text limiti: 2000 karakter
+            description = description[:2000]
         
         return {
             "Title": info.get("title"),
@@ -56,6 +65,7 @@ def fetch_from_google_books(title: str = None, author: str = None, isbn: str = N
             "ISBN13": isbn_13,
             "Average Rating": str(info.get("averageRating")) if info.get("averageRating") else None,
             "Cover URL": cover,
+            "Description": description,
         }
     except Exception as e:
         print(f"  ⚠️  Google Books error: {e}")

@@ -1,220 +1,101 @@
-import re
-import json
-import requests
+import json, re, requests
+from bs4 import BeautifulSoup
 from typing import Dict, Optional
-from utils import soup_from_html, extract_json_ld, textclean, pick_first
 
-HEADERS = lambda ua: {"User-Agent": ua or "Mozilla/5.0", "Accept-Language": "tr,en;q=0.8"}
+def _clean(s: Optional[str]) -> Optional[str]:
+    if s is None: return None
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or None
 
-class ScrapeError(Exception):
-    pass
+def _to_int(s: Optional[str]) -> Optional[int]:
+    if not s: return None
+    m = re.search(r"\d{1,4}", s)
+    return int(m.group(0)) if m else None
 
-def _og(soup, prop):
-    tag = soup.find("meta", property=f"og:{prop}")
-    return tag.get("content", "").strip() if tag and tag.get("content") else None
+def _find_book_json_ld(soup: BeautifulSoup) -> Optional[dict]:
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "")
+            # bazı sayfalarda liste/tek obje
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if isinstance(it, dict) and it.get("@type") in ("Book", ["Book"]):
+                    return it
+        except Exception:
+            continue
+    return None
 
-def _meta_name(soup, name):
-    tag = soup.find("meta", attrs={"name": name})
-    return tag.get("content", "").strip() if tag and tag.get("content") else None
-
-def _meta_prop(soup, prop):
-    tag = soup.find("meta", attrs={"property": prop})
-    return tag.get("content", "").strip() if tag and tag.get("content") else None
-
-def fetch(url: str, user_agent: Optional[str] = None) -> str:
-    r = requests.get(url, headers=HEADERS(user_agent), timeout=30)
-    r.raise_for_status()
-    return r.text
-
-# ---------- Google Books fallback (ISBN ile) ----------
-def googlebooks_by_isbn(isbn: Optional[str], user_agent: Optional[str] = None) -> Dict:
-    if not isbn:
-        return {}
-    try:
-        r = requests.get(
-            f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}",
-            headers=HEADERS(user_agent),
-            timeout=30,
-        )
-        if r.status_code != 200:
-            return {}
-        j = r.json()
-        items = j.get("items") or []
-        if not items:
-            return {}
-        v = items[0].get("volumeInfo", {})
-        lang = (v.get("language") or "").upper() if v.get("language") else None
-        year = None
-        if isinstance(v.get("publishedDate"), str) and v["publishedDate"][:4].isdigit():
-            year = int(v["publishedDate"][:4])
-        cover = None
-        if isinstance(v.get("imageLinks"), dict):
-            cover = v["imageLinks"].get("thumbnail") or v["imageLinks"].get("smallThumbnail")
-
-        return {
-            "Title": v.get("title"),
-            "Author": ", ".join(v.get("authors", [])) if v.get("authors") else None,
-            "Publisher": v.get("publisher"),
-            "Year Published": year,
-            "Number of Pages": v.get("pageCount"),
-            "coverURL": cover,
-            "Language": lang,
-            "Description": v.get("description"),
-        }
-    except Exception:
+def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
+    """
+    Goodreads kitap sayfasından alanları döndürür.
+    """
+    headers = {
+        "User-Agent": ua or "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+    if r.status_code != 200 or not r.text:
         return {}
 
-# ---------- 1000Kitap ----------
-def scrape_1000kitap(url: str, user_agent: Optional[str] = None) -> Dict:
-    html = fetch(url, user_agent)
-    soup = soup_from_html(html)
-    j = extract_json_ld(soup)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    title = textclean(pick_first(
-        j.get("name"),
-        soup.find("h1").get_text(strip=True) if soup.find("h1") else None,
-        _og(soup, "title"),
-    ))
+    # og metas
+    og_title = soup.find("meta", {"property": "og:title"})
+    og_image = soup.find("meta", {"property": "og:image"})
+    og_desc  = soup.find("meta", {"property": "og:description"})
 
+    title = _clean(og_title["content"]) if og_title and og_title.has_attr("content") else None
+    cover = _clean(og_image["content"]) if og_image and og_image.has_attr("content") else None
+    desc  = _clean(og_desc["content"])  if og_desc and og_desc.has_attr("content") else None
+
+    # JSON-LD (schema.org/Book) daha güvenilir
+    jd = _find_book_json_ld(soup) or {}
+
+    # author (tek ya da liste olabilir)
     author = None
-    if isinstance(j.get("author"), dict):
-        author = j.get("author", {}).get("name")
-    elif isinstance(j.get("author"), list) and j.get("author"):
-        a0 = j.get("author")[0]
-        if isinstance(a0, dict):
-            author = a0.get("name")
-    if not author:
-        a_tag = soup.find("a", href=re.compile(r"/yazar/"))
-        author = a_tag.get_text(strip=True) if a_tag else None
+    if jd.get("author"):
+        if isinstance(jd["author"], list):
+            author = ", ".join([_clean(a.get("name")) for a in jd["author"] if isinstance(a, dict) and a.get("name")])
+        elif isinstance(jd["author"], dict):
+            author = _clean(jd["author"].get("name"))
 
-    cover = pick_first(j.get("image"), _og(soup, "image"))
-
-    publisher = None
-    if isinstance(j.get("publisher"), dict):
-        publisher = j["publisher"].get("name")
-    elif isinstance(j.get("publisher"), str):
-        publisher = j.get("publisher")
-    if not publisher:
-        pub_a = soup.find("a", href=re.compile(r"/yayinevi/"))
-        publisher = pub_a.get_text(strip=True) if pub_a else None
-
-    translator = None
-    tr_a = soup.find("a", href=re.compile(r"/cevirmen/"))
-    if tr_a:
-        translator = tr_a.get_text(strip=True)
-
-    txt = soup.get_text(" ")
-    pages = None
-    m = re.search(r"(\d{1,4})\s*(sayfa)\b", txt, flags=re.I)
-    if m:
-        pages = int(m.group(1))
-
+    publisher = _clean(jd.get("publisher", {}).get("name") if isinstance(jd.get("publisher"), dict) else jd.get("publisher"))
     year = None
-    m2 = re.search(r"\b(19|20)\d{2}\b", txt)
-    if m2:
-        year = int(m2.group(0))
+    if isinstance(jd.get("datePublished"), str) and jd["datePublished"][:4].isdigit():
+        year = int(jd["datePublished"][:4])
 
-    # açıklama
-    desc = _meta_name(soup, "description") or (soup.find("p").get_text(strip=True) if soup.find("p") else None)
+    # ISBN & pages & language
+    isbn13 = _clean(jd.get("isbn"))
+    pages  = jd.get("numberOfPages")
+    if isinstance(pages, str):
+        pages = _to_int(pages)
+    lang = _clean(jd.get("inLanguage"))  # en, tr vs.
 
-    # dil
-    language = None
-    html_tag = soup.find("html")
-    if html_tag and html_tag.get("lang"):
-        language = html_tag["lang"].split("-")[0].upper()
-    elif "dil" in txt.lower():
-        mlang = re.search(r"[Dd]il[:\s]+([A-Za-zÇĞİÖŞÜçğıöşü]+)", txt)
-        if mlang:
-            language = mlang.group(1).capitalize()
+    # fallback: sayfa içinden ISBN/pages yakalamaya çalış
+    if not isbn13:
+        m = re.search(r'ISBN(?:-13)?:?\s*</[^>]+>\s*([0-9\-]{10,17})', r.text, flags=re.I)
+        if m: isbn13 = _clean(m.group(1)).replace("-", "")
+    if not pages:
+        m = re.search(r'(\d{1,4})\s+pages', r.text, flags=re.I)
+        if m: pages = int(m.group(1))
+
+    # Başlık JSON-LD içinde daha temiz olabilir
+    name = _clean(jd.get("name")) or title
+    description = _clean(jd.get("description")) or desc
 
     return {
-        "Title": title,
+        "Title": name,
         "Author": author,
-        "Translator": translator,
         "Publisher": publisher,
-        "Number of Pages": pages,
-        "coverURL": cover,
         "Year Published": year,
-        "Language": language,
-        "Description": desc,
-        "source": "1000kitap",
-    }
-
-def scrape_goodreads(url: str, user_agent: Optional[str] = None) -> Dict:
-    html = fetch(url, user_agent)
-    soup = soup_from_html(html)
-    j = extract_json_ld(soup)
-
-    # Title
-    title = textclean(pick_first(
-        _og(soup, "title"),
-        j.get("name"),
-    ))
-
-    # Author / Editor – yeni arayüz seçicileri
-    author = None
-    # 1) JSON-LD
-    if isinstance(j.get("author"), dict):
-        author = j["author"].get("name")
-    elif isinstance(j.get("author"), list) and j["author"]:
-        a0 = j["author"][0]
-        if isinstance(a0, dict):
-            author = a0.get("name")
-    # 2) meta[name="author"]
-    if not author:
-        author = _meta_name(soup, "author")
-    # 3) sayfa üzerindeki contributor linkleri
-    if not author:
-        a = soup.select_one('a[href*="/author/"], a.ContributorLink, [data-testid="name"]')
-        if a:
-            author = a.get_text(strip=True)
-
-    # Cover – birkaç olası kaynak
-    cover = pick_first(
-        _og(soup, "image"),
-        _meta_prop(soup, "og:image"),
-        j.get("image")
-    )
-
-    # ISBN, pages, year (OpenGraph 'books.*')
-    isbn = _meta_prop(soup, "books:isbn")
-    pages = None
-    mp = _meta_prop(soup, "books:page_count")
-    if mp and mp.isdigit():
-        pages = int(mp)
-    year = None
-    rdate = _meta_prop(soup, "books:release_date")
-    if rdate and rdate[:4].isdigit():
-        year = int(rdate[:4])
-
-    desc = _meta_name(soup, "description") or _og(soup, "description") or j.get("description")
-
-    # Language
-    language = None
-    if j.get("inLanguage"):
-        language = str(j.get("inLanguage")).upper()
-    else:
-        html_tag = soup.find("html")
-        if html_tag and html_tag.get("lang"):
-            language = html_tag["lang"].split("-")[0].upper()
-
-    data = {
-        "Title": title,
-        "Author": author,
-        "Publisher": None,
         "Number of Pages": pages,
+        "ISBN13": isbn13,
+        "Language": (lang or "").upper() if lang else None,
+        "Description": description,
         "coverURL": cover,
-        "Year Published": year,
-        "Language": language,
-        "Description": desc,
         "source": "goodreads",
     }
-
-    # ISBN varsa Google Books ile doğrula/zenginleştir (override)
-    gb = googlebooks_by_isbn(isbn, user_agent)
-    if gb:
-        for k, v in gb.items():
-            if v:
-                data[k] = v
-
-    return data

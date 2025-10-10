@@ -1,241 +1,238 @@
 # -*- coding: utf-8 -*-
-"""
-Goodreads kitap sayfasından (yalnızca /book/show/ …) alanları çeker.
-JSON-LD yoksa yeni/klasik arayüz seçicileri ve TR/EN regex'leriyle fallback yapar.
-'This edition' bloğuna öncelik verilir; publisher/year/pages/language burada aranır.
-"""
-import json
+from __future__ import annotations
 import re
+import html
+import time
 from typing import Dict, Optional
 
 import requests
 from bs4 import BeautifulSoup
 
+HEADERS_DEFAULT = lambda ua: {
+    "User-Agent": ua or (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.8,tr;q=0.7",
+}
 
-# -------------------- yardımcılar --------------------
+def _clean_text(x: Optional[str]) -> str:
+    if not x:
+        return ""
+    x = html.unescape(x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return x
 
-def _clean(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = re.sub(r"\s+", " ", s).strip()
-    return s or None
-
-def _to_int(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
-    m = re.search(r"\d{1,4}", s)
+def _int_or_none(s: str) -> Optional[int]:
+    m = re.search(r"\d+", s or "")
     return int(m.group(0)) if m else None
 
-def _slice_after(html: str, anchors, window: int = 3000) -> Optional[str]:
-    """HTML içinde verilen anchordan sonraki dar bir pencere döndür."""
-    if isinstance(anchors, str):
-        anchors = [anchors]
-    for a in anchors:
-        m = re.search(re.escape(a), html, flags=re.I)
-        if m:
-            start = m.start()
-            return html[start:start + window]
+def _meta_og_image(soup: BeautifulSoup) -> Optional[str]:
+    m = soup.find("meta", property="og:image")
+    if m and m.get("content"):
+        return m["content"].strip()
     return None
 
-def _find_book_json_ld(soup: BeautifulSoup) -> Optional[dict]:
-    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+def _select_text(soup: BeautifulSoup, css: str) -> str:
+    el = soup.select_one(css)
+    return _clean_text(el.get_text(" ", strip=True)) if el else ""
+
+def _extract_published_row(soup: BeautifulSoup) -> str:
+    """
+    Goodreads yeni tasarım:
+      - data-testid'li BookDetails satırları var
+      - 'Published' label'ını taşıyan satırdan metni al
+    Eski tasarım (fallback) için de bir iki seçenek deniyoruz.
+    """
+    # Yeni tasarım – label 'Published'
+    row = soup.select_one(
+        ".BookDetails .BookDetails__row:has(.BookDetails__label:contains('Published'))"
+    )
+    if row:
+        return _select_text(row, ".BookDetails__row")
+
+    # Alternatif yeni tasarım
+    row2 = soup.select_one("div[data-testid='publicationInfo']")
+    if row2:
+        return row2.get_text(" ", strip=True)
+
+    # Eski tasarım fallback
+    for cand in soup.find_all(["div", "span", "td"]):
         try:
-            data = json.loads(tag.string or "")
-            items = data if isinstance(data, list) else [data]
-            for it in items:
-                if isinstance(it, dict) and (
-                    it.get("@type") == "Book" or ("Book" in (it.get("@type") or []))
-                ):
-                    return it
+            txt = cand.get_text(" ", strip=True)
         except Exception:
             continue
-    return None
+        if txt and txt.lower().startswith("published"):
+            return txt
+    return ""
 
-def _fallback_title(soup: BeautifulSoup) -> Optional[str]:
-    el = soup.select_one('h1[data-testid="bookTitle"]') or soup.select_one("#bookTitle")
-    return _clean(el.get_text()) if el else None
-
-def _fallback_author(soup: BeautifulSoup) -> Optional[str]:
-    # yeni arayüz çeşitleri
-    selectors = [
-        '[data-testid="name"]',
-        '.ContributorLink__name',
-        'a[data-testid="authorName"]',
-        'a[href*="/author/"] span',
-        'a[href*="/author/"]',
-    ]
-    els = []
-    for sel in selectors:
-        els = soup.select(sel)
-        if els:
-            break
-    if not els:
-        # klasik
-        els = soup.select("a.authorName span") or soup.select("a.authorName")
-    names = [_clean(e.get_text()) for e in els]
-    names = [n for n in names if n and not n.lower().startswith("goodreads")]
-    if names:
-        # tekilleştir
-        seen, uniq = set(), []
-        for n in names:
-            if n not in seen:
-                seen.add(n)
-                uniq.append(n)
-        return ", ".join(uniq)
-    return None
-
-def _fallback_isbn(soup: BeautifulSoup, html: str) -> Optional[str]:
-    el = soup.find(attrs={"itemprop": "isbn"})
-    if el and _clean(el.get_text()):
-        return re.sub(r"[^0-9Xx]", "", _clean(el.get_text()))
-    m = re.search(
-        r'<meta[^>]+property=["\']books:isbn["\'][^>]+content=["\']([^"\']+)["\']',
-        html, flags=re.I,
-    )
-    if m:
-        return re.sub(r"[^0-9Xx]", "", m.group(1))
-    m = re.search(r'ISBN(?:-13)?:?\s*</[^>]+>\s*([0-9\-Xx]{10,17})', html, flags=re.I)
-    if m:
-        return re.sub(r"[^0-9Xx]", "", m.group(1))
-    return None
-
-def _fallback_pages(soup: BeautifulSoup, html: str) -> Optional[int]:
-    el = soup.find(attrs={"itemprop": "numberOfPages"})
-    if el and _clean(el.get_text()):
-        return _to_int(el.get_text())
-    m = re.search(r'(\d{1,4})\s*(?:pages?|sayfa)\b', html, flags=re.I)
-    return int(m.group(1)) if m else None
-
-def _fallback_publisher_year_from_block(block: str) -> (Optional[str], Optional[int]):
-    pub = None
-    year = None
-    if not block:
-        return pub, year
-    my = re.search(r'Published[^<\n]*?\b(1[5-9]\d{2}|20\d{2})\b', block, flags=re.I)
-    if my:
-        year = int(my.group(1))
-    mp = re.search(r'Published[^<\n]*?by\s*([^<,\n]+)', block, flags=re.I)
-    if mp:
-        pub = _clean(mp.group(1))
-    return pub, year
-
-def _fallback_language_from_block(block: str) -> Optional[str]:
-    if not block:
+def _publisher_from_published(text: str) -> Optional[str]:
+    """Only pick the 'by <publisher>' part from the Published text."""
+    if not text:
         return None
-    ml = re.search(r'Language[^:<\n]*[:>]\s*([A-Za-zÇĞİÖŞÜçğıöşü\- ]+)', block, flags=re.I)
-    if ml:
-        return _clean(ml.group(1))
+    # en güvenilir yaklaşım: ' by ' ile ayır
+    if " by " in text:
+        pub = text.split(" by ")[-1].strip()
+    elif "by" in text:
+        pub = text.split("by")[-1].strip()
+    else:
+        pub = ""
+
+    pub = _clean_text(pub)
+    # Rakam barındırıyorsa (yıl/sayfa) muhtemelen yanlış
+    if any(ch.isdigit() for ch in pub):
+        return None
+    # Kısa çöplerden kaç
+    if len(pub) < 2:
+        return None
+    return pub
+
+def _year_from_published(text: str) -> Optional[int]:
+    """
+    Published ... 1 September 1952 by ... → 1952
+    """
+    if not text:
+        return None
+    m = re.search(r"(19|20)\d{2}", text)
+    return int(m.group(0)) if m else None
+
+def _pages_from_block(soup: BeautifulSoup) -> Optional[int]:
+    """
+    Yeni tasarımda: data-testid='pagesFormat' içinde '138 pages' gibi.
+    """
+    t = _select_text(soup, "[data-testid='pagesFormat']")
+    if not t:
+        # eski tasarım: 'pages' içeren küçük stringler
+        candidate = soup.find(string=re.compile(r"\bpages\b", re.I))
+        t = _clean_text(candidate) if candidate else ""
+    return _int_or_none(t)
+
+def _language_from_details(soup: BeautifulSoup) -> Optional[str]:
+    # Yeni tasarım: 'Edition language' satırı
+    row = soup.select_one(
+        ".BookDetails .BookDetails__row:has(.BookDetails__label:contains('Edition language'))"
+    )
+    if row:
+        val = row.select_one(".BookDetails__description")
+        if val:
+            return _clean_text(val.get_text(" ", strip=True))
+    # Eski tasarım (fallback)
+    candidate = soup.find(string=re.compile(r"Edition language", re.I))
+    if candidate:
+        parent = candidate.find_parent()
+        if parent:
+            return _clean_text(parent.get_text(" ", strip=True).replace("Edition language", ""))
     return None
 
+def _isbn13_from_details(soup: BeautifulSoup) -> Optional[str]:
+    # Yeni tasarım: 'ISBN13' satırı
+    row = soup.select_one(
+        ".BookDetails .BookDetails__row:has(.BookDetails__label:contains('ISBN13'))"
+    )
+    if row:
+        val = row.select_one(".BookDetails__description")
+        if val:
+            text = _clean_text(val.get_text(" ", strip=True))
+            m = re.search(r"(97(8|9))\d{10}", text.replace("-", ""))
+            if m:
+                return m.group(0)
+    # Eski tasarım fallback
+    m = soup.find(string=re.compile(r"ISBN13", re.I))
+    if m:
+        candidate = _clean_text(m.parent.get_text(" ", strip=True))
+        mm = re.search(r"(97(8|9))\d{10}", candidate.replace("-", ""))
+        if mm:
+            return mm.group(0)
+    return None
 
-# -------------------- ana fonksiyon --------------------
+def _description(soup: BeautifulSoup) -> Optional[str]:
+    # data-testid'li açıklama kutuları
+    d = soup.select_one("[data-testid='description']") or soup.select_one("[data-testid='bookDescription']")
+    if d:
+        return _clean_text(d.get_text(" ", strip=True))
+    # fallback
+    d2 = soup.select_one("#description") or soup.select_one(".description")
+    return _clean_text(d2.get_text(" ", strip=True)) if d2 else None
 
-def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
-    headers = {
-        "User-Agent": ua or "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-        "Referer": "https://www.google.com/",
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-    except Exception:
-        return {}
+def _title(soup: BeautifulSoup) -> Optional[str]:
+    # yeni
+    t = _select_text(soup, "h1[data-testid='bookTitle']")
+    if t:
+        return t
+    # eski
+    t = _select_text(soup, "#bookTitle")
+    return t or None
 
-    if r.status_code != 200 or not r.text:
-        return {}
+def _author(soup: BeautifulSoup) -> Optional[str]:
+    # yeni
+    a = _select_text(soup, "a.ContributorLink__name") or _select_text(soup, "span.AuthorName__name")
+    if a:
+        return a
+    # eski
+    a = _select_text(soup, "a.authorName span")
+    return a or None
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    html = r.text
+def fetch_goodreads(url: str, ua: Optional[str] = None, timeout: int = 25) -> Dict[str, Optional[str]]:
+    """
+    Goodreads kitap sayfasından alanları döndürür.
+    Dönüş:
+      Title, Author, Publisher, Year Published, Number of Pages, Language,
+      ISBN13, Description, coverURL
+    """
+    url = url.strip()
+    # bazen /book/show/ dışındaki url’ler yönleniyor → requests takip ediyor
+    headers = HEADERS_DEFAULT(ua)
+    resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
 
-    # canonical kitap linkine geç
-    canon = soup.find("link", attrs={"rel": "canonical"})
-    if canon and canon.has_attr("href"):
-        href = canon["href"]
-        if "/book/show/" in href and href != r.url:
-            r = requests.get(href, headers=headers, timeout=30, allow_redirects=True)
-            if r.status_code == 200 and r.text:
-                soup = BeautifulSoup(r.text, "html.parser")
-                html = r.text
+    # Cloudflare vb. anlık engel durumlarında küçük bekleme tekrar
+    if resp.status_code in (403, 503) and "cf" in resp.headers.get("server", "").lower():
+        time.sleep(1.0)
+        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
 
-    # og metas
-    og_image = soup.find("meta", {"property": "og:image"})
-    og_title = soup.find("meta", {"property": "og:title"})
-    og_desc  = soup.find("meta", {"property": "og:description"})
-    cover = _clean(og_image["content"]) if og_image and og_image.has_attr("content") else None
-    ogt   = _clean(og_title["content"]) if og_title and og_title.has_attr("content") else None
-    desc  = _clean(og_desc["content"])  if og_desc and og_desc.has_attr("content") else None
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # JSON-LD
-    jd = _find_book_json_ld(soup) or {}
+    data: Dict[str, Optional[str]] = {}
 
-    # Title
-    title = _clean(jd.get("name")) or ogt or _fallback_title(soup)
+    data["Title"] = _title(soup)
+    data["Author"] = _author(soup)
 
-    # Author
-    author = None
-    if jd.get("author"):
-        if isinstance(jd["author"], list):
-            author = ", ".join([_clean(a.get("name")) for a in jd["author"] if isinstance(a, dict) and a.get("name")])
-        elif isinstance(jd["author"], dict):
-            author = _clean(jd["author"].get("name"))
-    if not author:
-        author = _fallback_author(soup)
+    # Published satırından publisher & year
+    published_text = _extract_published_row(soup)
+    data["Publisher"] = _publisher_from_published(published_text)
+    y = _year_from_published(published_text)
+    data["Year Published"] = y if y is None else int(y)
 
-    # ---- “This edition / Format / Published” bloğunu daralt ----
-    details = _slice_after(html, ["This edition", "Format", "Published"], window=3500)
+    # Sayfa sayısı
+    data["Number of Pages"] = _pages_from_block(soup)
 
-    # Publisher & Year (önce dar blokta dene)
-    pub, year = _fallback_publisher_year_from_block(details)
-    if not year:
-        mf = re.search(r'First published[^<\n]*?\b(1[5-9]\d{2}|20\d{2})\b', html, flags=re.I)
-        if mf:
-            year = int(mf.group(1))
-    if not pub:
-        # geniş fallback (son çare)
-        p2, y2 = _fallback_publisher_year_from_block(html)
-        pub = pub or p2
-        year = year or y2
+    # Dil
+    data["Language"] = _language_from_details(soup)
 
-    # Pages
-    pages = _fallback_pages(soup, details or html)
-
-    # ISBN
-    isbn13 = _clean(jd.get("isbn")) or _fallback_isbn(soup, html)
-
-    # Language
-    lang = _clean(jd.get("inLanguage")) or _fallback_language_from_block(details or html)
-    if lang:
-        lang = _clean(lang.title() if len(lang) < 6 else lang)
+    # ISBN13
+    data["ISBN13"] = _isbn13_from_details(soup)
 
     # Description
-    description = _clean(jd.get("description")) or desc
+    data["Description"] = _description(soup)
 
-    # ---- Notion güvenlik limitleri ----
-    if pub:
-        pub = pub.replace("\n", " ").strip()[:200]
-    if title:
-        title = title.strip()[:1000]
-    if author:
-        author = author.strip()[:1000]
-    if description:
-        description = description.strip()[:1900]
+    # Kapak (og:image veya data-testid cover)
+    cover = _meta_og_image(soup) or None
+    if not cover:
+        cover_img = soup.select_one("[data-testid='coverImage'] img") or soup.select_one("img.BookCover__image")
+        if cover_img and cover_img.get("src"):
+            cover = cover_img["src"]
+    data["coverURL"] = cover
 
-    data = {
-        "Title": title,
-        "Author": author,
-        "Publisher": pub,
-        "Year Published": year,
-        "Number of Pages": pages,
-        "ISBN13": isbn13,
-        "Language": lang,
-        "Description": description,
-        "coverURL": cover,
-        "source": "goodreads",
-    }
+    # Temizle/Kısalt – uzun metinleri notion tarafında da sınırlıyoruz ama burada da sadeleyelim
+    if data.get("Description"):
+        data["Description"] = data["Description"][:1900]
 
-    if not any([title, author, cover, isbn13]):
-        print(f"WARN could not parse GR: {url}")
-        return {}
+    # Boş/yanlış publisher’ları None yap
+    if data.get("Publisher"):
+        pub = data["Publisher"]
+        if any(ch.isdigit() for ch in pub or "") or len(pub or "") < 2:
+            data["Publisher"] = None
 
     return data

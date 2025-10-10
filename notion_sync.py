@@ -29,21 +29,36 @@ def client() -> Client:
 
 def _prop_empty(prop: Dict[str, Any]) -> bool:
     """
-    Notion propery boş mu?
-    ÖNEMLİ: Title 'Goodreads' ise de BOŞ say (linkten otomatik gelen yer tutucu).
+    Notion property boş mu?
+    ÖNEMLİ: Yer tutucu metinler de boş sayılır:
+      - "Goodreads" (Title rich_text veya title)
+      - "Authors", "Author"
     """
     if not prop:
         return True
+
+    placeholders = {"goodreads", "authors", "author", "good reads"}
+
+    # Page title property
     if "title" in prop:
         texts = [t.get("plain_text", "") for t in prop.get("title", [])]
         text = "".join(texts).strip()
         if not text:
             return True
-        if text.lower() in {"goodreads", "good reads"}:
+        if text.lower() in placeholders:
             return True
         return False
+
+    # Rich text property (sende Title bu tip)
     if "rich_text" in prop:
-        return len(prop.get("rich_text", [])) == 0
+        texts = [t.get("plain_text", "") for t in prop.get("rich_text", [])]
+        text = "".join(texts).strip()
+        if not text:
+            return True
+        if text.lower() in placeholders:
+            return True
+        return False
+
     if "number" in prop:
         return prop.get("number") is None
     if "url" in prop:
@@ -53,7 +68,6 @@ def _prop_empty(prop: Dict[str, Any]) -> bool:
     if "date" in prop:
         return prop.get("date") is None
     return True
-
 
 def _enc(schema: Dict[str, Any], value: Any) -> Dict[str, Any]:
     if value in (None, ""):

@@ -139,27 +139,18 @@ def build_updates(schema: Dict[str, Any], scraped: Dict[str, Any], current: Dict
 
 def query_targets() -> Dict[str, Any]:
     """
-    Varsayılan: goodreadsURL dolu, URL kitap linki ve Title/Author boş olanları getir.
-    FORCE_UPDATE=true ise: goodreadsURL dolu ve URL kitap linki olan TÜM sayfaları getirir.
+    Goodreads URL'i olan tüm sayfaları getir.
+    Alanın yazılıp yazılmayacağına _prop_empty ve OVERWRITE karar verir.
+    FORCE_UPDATE=true ise her alan üzerine yazılır.
     """
     c = client()
     filters = [
         {"property": "goodreadsURL", "url": {"is_not_empty": True}},
         {"property": "goodreadsURL", "url": {"contains": "/book/show/"}},
     ]
-    if not FORCE_UPDATE:
-        filters.append(
-            {
-                "or": [
-                    {"property": "Title", "title": {"is_empty": True}},
-                    {"property": "Author", "rich_text": {"is_empty": True}},
-                ]
-            }
-        )
     return c.databases.query(
         database_id=DATABASE_ID, filter={"and": filters}, page_size=100
     )
-
 
 def update_page(page_id: str, scraped: Dict[str, Any]) -> None:
     c = client()

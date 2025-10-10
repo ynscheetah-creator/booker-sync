@@ -2,10 +2,13 @@
 import os
 import re
 from typing import Optional
-from dotenv import load_dotenv
 
-# .env dosyasını yükle
-load_dotenv()
+# .env dosyası varsa yükle (lokalde test için), yoksa devam et (GitHub Secrets için)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv yüklü değilse sorun değil
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:

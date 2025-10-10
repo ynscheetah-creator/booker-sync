@@ -1,34 +1,57 @@
-name: Sync Notion (Goodreads-only)
+name: Sync Goodreads → Notion
 
 on:
+  # Elle çalıştırma
   workflow_dispatch:
-  # Otomatiği açmak istersen aşağıdaki schedule'ı yorumdan çıkar (ör. her 15 dk)
-  # schedule:
-  #   - cron: '*/15 * * * *'
+    inputs:
+      note:
+        description: "Çalıştır: DB'de goodreadsURL dolu olan sayfaları zenginleştirir"
+        required: false
+        default: "Run sync"
+  # İstersen değiştir: her 30 dakikada bir
+  schedule:
+    - cron: "*/30 * * * *"
+  # Kod/requirements değişince otomatik tetiklemek istersen:
+  push:
+    paths:
+      - "notion_sync.py"
+      - "goodreads_scraper.py"
+      - "requirements.txt"
+      - ".github/workflows/sync.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-goodreads-to-notion
+  cancel-in-progress: false
 
 jobs:
   sync:
+    name: Run sync
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
+    env:
+      # Zorunlu env değişkenleri (Repo Secrets bölümü)
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      # 403 riskini azaltmak için gerçek bir tarayıcı UA ekleyin
+      USER_AGENT: ${{ secrets.USER_AGENT }}
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          USER_AGENT: ${{ secrets.USER_AGENT }}
-          OVERWRITE: ${{ secrets.OVERWRITE }}
+      - name: Run sync (scan DB & update pages)
         run: |
-          source .venv/bin/activate
-          python enrich_from_goodreads.py
+          python notion_sync.py

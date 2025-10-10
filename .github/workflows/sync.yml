@@ -1,7 +1,10 @@
-name: Sync Notion (Books)
+name: Sync Notion (Goodreads-only)
 
 on:
   workflow_dispatch:
+  # Otomatiği açmak istersen aşağıdaki schedule'ı yorumdan çıkar (ör. her 15 dk)
+  # schedule:
+  #   - cron: '*/15 * * * *'
 
 jobs:
   sync:
@@ -25,6 +28,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           USER_AGENT: ${{ secrets.USER_AGENT }}
+          OVERWRITE: ${{ secrets.OVERWRITE }}
         run: |
           source .venv/bin/activate
-          python main.py
+          python enrich_from_goodreads.py

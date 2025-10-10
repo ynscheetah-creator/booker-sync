@@ -25,9 +25,6 @@ def _find_book_json_ld(soup: BeautifulSoup) -> Optional[dict]:
     return None
 
 def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
-    """
-    Goodreads kitap sayfasından alanları döndürür.
-    """
     headers = {
         "User-Agent": ua or "Mozilla/5.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -42,14 +39,28 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # og metas
-    og_title = soup.find("meta", {"property": "og:title"})
-    og_image = soup.find("meta", {"property": "og:image"})
-    og_desc  = soup.find("meta", {"property": "og:description"})
+    # 1) Eğer URL kitap sayfası değilse, canonical ile gerçek kitabı bulmayı dene
+    canon = soup.find("link", attrs={"rel":"canonical"})
+    if canon and canon.has_attr("href"):
+        href = canon["href"]
+        if "/book/show/" in href and href != r.url:
+            r = requests.get(href, headers=headers, timeout=30, allow_redirects=True)
+            if r.status_code != 200 or not r.text:
+                return {}
+            soup = BeautifulSoup(r.text, "html.parser")
 
-    title = _clean(og_title["content"]) if og_title and og_title.has_attr("content") else None
-    cover = _clean(og_image["content"]) if og_image and og_image.has_attr("content") else None
-    desc  = _clean(og_desc["content"])  if og_desc and og_desc.has_attr("content") else None
+    # 2) Son sayfa yine de kitap değilse (og:type veya JSON-LD yoksa) atla
+    og_type = soup.find("meta", {"property": "og:type"})
+    if og_type and og_type.has_attr("content"):
+        if og_type["content"].lower() not in ("book","books.book"):
+            return {}
+
+    jd = _find_book_json_ld(soup)
+    if not jd:
+        # JSON-LD yoksa da güvenilir değil → atla
+        return {}
+
+    # ... (buradan sonrası senin mevcut kodunla aynı; jd kullanılıyor)
 
     # JSON-LD (schema.org/Book)
     jd = _find_book_json_ld(soup) or {}

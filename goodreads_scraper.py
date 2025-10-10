@@ -29,8 +29,15 @@ def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
     """Yeni Goodreads HTML yapısına göre kitap verilerini döndürür."""
     res = requests.get(url, headers=HEADERS, timeout=25)
     res.raise_for_status()
-    soup = BeautifulSoup(res.text, "lxml")
-
+   def _make_soup(html: str) -> BeautifulSoup:
+    # Önce lxml, yoksa html5lib, o da yoksa html.parser
+    for parser in ("lxml", "html5lib", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    # En kötü senaryo
+    return BeautifulSoup(html, "html.parser")
     data = {
         "goodreadsURL": url,
         "Book Id": None,

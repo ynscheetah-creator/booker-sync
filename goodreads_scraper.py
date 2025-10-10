@@ -16,7 +16,6 @@ def _find_book_json_ld(soup: BeautifulSoup) -> Optional[dict]:
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(tag.string or "")
-            # bazı sayfalarda liste/tek obje
             items = data if isinstance(data, list) else [data]
             for it in items:
                 if isinstance(it, dict) and it.get("@type") in ("Book", ["Book"]):
@@ -52,10 +51,10 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
     cover = _clean(og_image["content"]) if og_image and og_image.has_attr("content") else None
     desc  = _clean(og_desc["content"])  if og_desc and og_desc.has_attr("content") else None
 
-    # JSON-LD (schema.org/Book) daha güvenilir
+    # JSON-LD (schema.org/Book)
     jd = _find_book_json_ld(soup) or {}
 
-    # author (tek ya da liste olabilir)
+    # author (tek/liste)
     author = None
     if jd.get("author"):
         if isinstance(jd["author"], list):
@@ -68,14 +67,13 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
     if isinstance(jd.get("datePublished"), str) and jd["datePublished"][:4].isdigit():
         year = int(jd["datePublished"][:4])
 
-    # ISBN & pages & language
     isbn13 = _clean(jd.get("isbn"))
     pages  = jd.get("numberOfPages")
     if isinstance(pages, str):
         pages = _to_int(pages)
-    lang = _clean(jd.get("inLanguage"))  # en, tr vs.
+    lang = _clean(jd.get("inLanguage"))
 
-    # fallback: sayfa içinden ISBN/pages yakalamaya çalış
+    # fallback'lar
     if not isbn13:
         m = re.search(r'ISBN(?:-13)?:?\s*</[^>]+>\s*([0-9\-]{10,17})', r.text, flags=re.I)
         if m: isbn13 = _clean(m.group(1)).replace("-", "")
@@ -83,7 +81,6 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
         m = re.search(r'(\d{1,4})\s+pages', r.text, flags=re.I)
         if m: pages = int(m.group(1))
 
-    # Başlık JSON-LD içinde daha temiz olabilir
     name = _clean(jd.get("name")) or title
     description = _clean(jd.get("description")) or desc
 

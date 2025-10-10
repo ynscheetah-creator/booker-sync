@@ -3,7 +3,7 @@ name: Sync Notion (Books)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"  # Her 6 saatte bir
+    - cron: "0 */6 * * *"
 
 jobs:
   sync:
@@ -15,6 +15,23 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install ChromeDriver
+        run: |
+          CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d '.' -f 1)
+          wget -O /tmp/chromedriver.zip https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_VERSION}
+          DRIVER_VERSION=$(cat /tmp/chromedriver.zip)
+          wget -O /tmp/chromedriver.zip https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/chromedriver_linux64.zip
+          unzip /tmp/chromedriver.zip -d /tmp/
+          sudo mv /tmp/chromedriver /usr/local/bin/
+          sudo chmod +x /usr/local/bin/chromedriver
 
       - name: Install deps
         run: |
@@ -33,7 +50,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4  # ✅ v3 -> v4 yaptık
+        uses: actions/upload-artifact@v4
         with:
           name: error-logs
           path: |

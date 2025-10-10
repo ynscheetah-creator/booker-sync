@@ -8,10 +8,9 @@ def fetch_from_openlibrary(title: str = None, author: str = None, isbn: str = No
     """OpenLibrary API'den kitap bilgisi çek"""
     
     try:
-        time.sleep(0.5)  # Rate limiting
+        time.sleep(0.5)
         
         if isbn:
-            # ISBN ile direkt sorgula
             url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
             res = requests.get(url, timeout=10)
             res.raise_for_status()
@@ -23,6 +22,11 @@ def fetch_from_openlibrary(title: str = None, author: str = None, isbn: str = No
             
             book = data[key]
             
+            # Excerpt (açıklama)
+            description = None
+            if book.get("excerpts"):
+                description = book["excerpts"][0].get("text", "")[:2000]
+            
             return {
                 "Title": book.get("title"),
                 "Author": ", ".join([a["name"] for a in book.get("authors", [])]),
@@ -30,10 +34,10 @@ def fetch_from_openlibrary(title: str = None, author: str = None, isbn: str = No
                 "Year Published": str(book.get("publish_date", ""))[:4] if book.get("publish_date") else None,
                 "Number of Pages": str(book.get("number_of_pages")) if book.get("number_of_pages") else None,
                 "Cover URL": book.get("cover", {}).get("large") if book.get("cover") else None,
+                "Description": description,
             }
         
         elif title:
-            # Title ile ara
             search_url = "https://openlibrary.org/search.json"
             params = {"title": title, "limit": 1}
             if author:
@@ -48,6 +52,11 @@ def fetch_from_openlibrary(title: str = None, author: str = None, isbn: str = No
             
             doc = search_data["docs"][0]
             
+            # First sentence as description
+            description = None
+            if doc.get("first_sentence"):
+                description = ". ".join(doc["first_sentence"])[:2000]
+            
             return {
                 "Title": doc.get("title"),
                 "Author": ", ".join(doc.get("author_name", [])) if doc.get("author_name") else None,
@@ -56,6 +65,7 @@ def fetch_from_openlibrary(title: str = None, author: str = None, isbn: str = No
                 "Number of Pages": str(doc.get("number_of_pages_median")) if doc.get("number_of_pages_median") else None,
                 "ISBN": doc.get("isbn", [None])[0] if doc.get("isbn") else None,
                 "Cover URL": f"https://covers.openlibrary.org/b/id/{doc['cover_i']}-L.jpg" if doc.get("cover_i") else None,
+                "Description": description,
             }
         
         return {}

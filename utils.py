@@ -1,24 +1,24 @@
 # utils.py
 import os
 import re
-from typing import Optional
+from typing import Optional, List
 
-# .env dosyası varsa yükle (lokalde test için), yoksa devam et (GitHub Secrets için)
+# .env dosyası varsa yükle
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv yüklü değilse sorun değil
+    pass
 
 
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    """Environment variable'ı oku, yoksa default değeri döndür."""
+    """Environment variable'ı oku"""
     val = os.environ.get(name)
     return val if (val is not None and str(val).strip()) else default
 
 
 def get_user_agent() -> str:
-    """User agent string döndür."""
+    """User agent string döndür"""
     return get_env(
         "USER_AGENT",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -27,20 +27,19 @@ def get_user_agent() -> str:
 
 
 def truncate(txt: Optional[str], max_len: int = 2000) -> Optional[str]:
-    """Metni maximum uzunluğa kısalt."""
+    """Metni maximum uzunluğa kısalt"""
     if txt is None:
         return None
     return txt[:max_len]
 
 
 def to_int(value: Optional[str]) -> Optional[int]:
-    """String'i int'e çevir, başarısızsa None döndür."""
+    """String'i int'e çevir"""
     if value is None:
         return None
     try:
         return int(value)
     except Exception:
-        # Sadece sayıyı çekip deneyelim
         m = re.search(r"(\d+)", str(value))
         if m:
             try:
@@ -52,29 +51,48 @@ def to_int(value: Optional[str]) -> Optional[int]:
 
 # Notion tip yardımcıları
 def as_title(value: Optional[str]):
-    """Notion title property formatına çevir."""
+    """Notion title property formatına çevir"""
     if not value:
         return None
     return {"title": [{"type": "text", "text": {"content": truncate(value)}}]}
 
 
 def as_rich(value: Optional[str]):
-    """Notion rich_text property formatına çevir."""
+    """Notion rich_text property formatına çevir"""
     if not value:
         return None
     return {"rich_text": [{"type": "text", "text": {"content": truncate(value)}}]}
 
 
 def as_url(value: Optional[str]):
-    """Notion url property formatına çevir."""
+    """Notion url property formatına çevir"""
     if not value:
         return None
     return {"url": value}
 
 
 def as_number(value: Optional[str]):
-    """Notion number property formatına çevir."""
+    """Notion number property formatına çevir"""
     num = to_int(value) if not isinstance(value, (int, float)) else value
     if num is None:
         return None
     return {"number": num}
+
+
+def as_multi_select(value: Optional[str]) -> Optional[dict]:
+    """
+    Notion multi_select property formatına çevir.
+    value: "Author1, Author2, Author3" veya "Author1"
+    """
+    if not value:
+        return None
+    
+    # Virgülle ayrılmış yazarları parse et
+    authors = [a.strip() for a in value.split(",") if a.strip()]
+    
+    if not authors:
+        return None
+    
+    return {
+        "multi_select": [{"name": author} for author in authors]
+    }

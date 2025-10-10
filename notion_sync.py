@@ -45,6 +45,19 @@ def _extract_book_id_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _normalize_title(title: str) -> str:
+    """Title'ı normalize et (API sorguları için)"""
+    if not title:
+        return ""
+    # Küçük harf yap
+    title = title.lower()
+    # Noktalama işaretlerini temizle
+    title = re.sub(r"[^\w\s]", "", title)
+    # Fazla boşlukları temizle
+    title = " ".join(title.split())
+    return title
+
+
 def _build_updates(scraped: Dict[str, Optional[str]]) -> Dict[str, Any]:
     """API'den gelen veriyi Notion update body'sine çevir"""
     body: Dict[str, Any] = {}
@@ -103,47 +116,75 @@ def _set_page_cover(page_id: str, cover_url: Optional[str]):
         print(f"  ⚠️  Cover update failed: {e}")
 
 
-def fetch_book_data(title: str = None, author: str = None, isbn: str = None, goodreads_url: str = None) -> Dict[str, Optional[str]]:
+def fetch_book_data(
+    title: str = None,
+    author: str = None,
+    isbn: str = None,
+    isbn13: str = None,
+    goodreads_url: str = None
+) -> Dict[str, Optional[str]]:
     """
-    Birden fazla kaynaktan kitap verisi çek:
-    1. Google Books (en kapsamlı)
-    2. OpenLibrary (yedek)
+    Birden fazla stratejiden kitap verisi çek:
+    1. ISBN/ISBN13 varsa önce onu kullan (en güvenilir)
+    2. Title + Author ile ara
+    3. Sadece Title ile ara
     """
     data = {}
     
-    # Book ID'yi sakla
+    # Book ID ve Goodreads URL'yi sakla
     if goodreads_url:
         book_id = _extract_book_id_from_url(goodreads_url)
         if book_id:
             data["Book Id"] = book_id
             data["goodreadsURL"] = goodreads_url
     
-    # 1. Google Books'tan dene
-    print("  🔍 Trying Google Books API...")
-    google_data = fetch_from_google_books(title=title, author=author, isbn=isbn)
+    # ISBN varsa önce onu kullan
+    search_isbn = isbn13 or isbn
     
-    if google_data and google_data.get("Title"):
-        print(f"  ✅ Found in Google Books: {google_data['Title']}")
-        data.update({k: v for k, v in google_data.items() if v})
-        return data
+    if search_isbn:
+        print(f"  🔍 Searching by ISBN: {search_isbn}")
+        
+        # Google Books ile dene
+        google_data = fetch_from_google_books(isbn=search_isbn)
+        if google_data and google_data.get("Title"):
+            print(f"  ✅ Found in Google Books (ISBN): {google_data['Title']}")
+            data.update({k: v for k, v in google_data.items() if v})
+            return data
+        
+        # OpenLibrary ile dene
+        ol_data = fetch_from_openlibrary(isbn=search_isbn)
+        if ol_data and ol_data.get("Title"):
+            print(f"  ✅ Found in OpenLibrary (ISBN): {ol_data['Title']}")
+            data.update({k: v for k, v in ol_data.items() if v})
+            return data
     
-    # 2. OpenLibrary'den dene
-    print("  🔍 Trying OpenLibrary API...")
-    ol_data = fetch_from_openlibrary(title=title, author=author, isbn=isbn)
-    
-    if ol_data and ol_data.get("Title"):
-        print(f"  ✅ Found in OpenLibrary: {ol_data['Title']}")
-        data.update({k: v for k, v in ol_data.items() if v})
-        return data
+    # ISBN yoksa Title + Author ile ara
+    if title:
+        print(f"  🔍 Searching by Title: {title[:50]}...")
+        
+        # Google Books
+        google_data = fetch_from_google_books(title=title, author=author)
+        if google_data and google_data.get("Title"):
+            print(f"  ✅ Found in Google Books: {google_data['Title']}")
+            data.update({k: v for k, v in google_data.items() if v})
+            return data
+        
+        # OpenLibrary
+        ol_data = fetch_from_openlibrary(title=title, author=author)
+        if ol_data and ol_data.get("Title"):
+            print(f"  ✅ Found in OpenLibrary: {ol_data['Title']}")
+            data.update({k: v for k, v in ol_data.items() if v})
+            return data
     
     print("  ⚠️  No data found from any API")
     return data
 
 
 def run_once():
-    """Notion database'deki tüm sayfaları tara ve Goodreads linklerini işle"""
+    """Notion database'deki tüm sayfaları tara"""
     print("🚀 Starting Goodreads → Notion sync...\n")
-    print("📖 Using Google Books + OpenLibrary APIs\n")
+    print("📖 Using Google Books + OpenLibrary APIs")
+    print("💡 TIP: Add ISBN/ISBN13 to Notion for best results!\n")
 
     # Notion'dan sayfaları çek
     results = []
@@ -176,13 +217,15 @@ def run_once():
         existing_title = _get_prop_value(props.get("Title"))
         existing_author = _get_prop_value(props.get("Author"))
         existing_isbn = _get_prop_value(props.get("ISBN"))
+        existing_isbn13 = _get_prop_value(props.get("ISBN13"))
 
-        # Goodreads URL yoksa ve mevcut bilgi de yoksa atla
-        if not gr_url and not existing_title:
+        # Hiçbir bilgi yoksa atla
+        if not any([gr_url, existing_title, existing_isbn, existing_isbn13]):
             skipped_count += 1
             continue
 
-        print(f"[{idx}/{len(results)}] 📖 Processing: {existing_title or gr_url}")
+        display_name = existing_title or existing_isbn or existing_isbn13 or gr_url
+        print(f"[{idx}/{len(results)}] 📖 {display_name[:60]}")
 
         # API'lerden veri çek
         try:
@@ -190,6 +233,7 @@ def run_once():
                 title=existing_title,
                 author=existing_author,
                 isbn=existing_isbn,
+                isbn13=existing_isbn13,
                 goodreads_url=gr_url if gr_url else None
             )
         except Exception as e:
@@ -218,9 +262,15 @@ def run_once():
             error_count += 1
             continue
 
-    print("=" * 50)
+    print("=" * 60)
     print(f"✅ Sync completed!")
     print(f"   Updated: {updated_count}")
     print(f"   Skipped: {skipped_count}")
     print(f"   Errors: {error_count}")
-    print("=" * 50)
+    print("=" * 60)
+    
+    if updated_count == 0 and error_count == 0:
+        print("\n💡 TIPS:")
+        print("   - Add ISBN or ISBN13 to Notion for best results")
+        print("   - Make sure book titles match exactly")
+        print("   - Try English titles if Turkish doesn't work")

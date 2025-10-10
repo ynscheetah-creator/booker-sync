@@ -76,7 +76,6 @@ def _build_updates(
 ) -> Dict[str, Any]:
     """
     API'den gelen veriyi Notion update body'sine çevir.
-    force_update=True ise tüm alanları güncelle (ISBN değişirse)
     """
     body: Dict[str, Any] = {}
 
@@ -106,21 +105,20 @@ def _build_updates(
         if scraped.get("Average Rating"):
             body["Average Rating"] = as_number(scraped["Average Rating"])
         
-        # Author: Multi-select
+        # Multi-select alanlar
         if scraped.get("Author"):
             body["Author"] = as_multi_select(scraped["Author"])
         
-        # Additional Authors: Multi-select (çevirmenler vs)
         if scraped.get("Additional Authors"):
             body["Additional Authors"] = as_multi_select(scraped["Additional Authors"])
         
-        # ISBN: Tek kolon
+        # ISBN
         if scraped.get("ISBN13") or scraped.get("ISBN"):
             isbn_value = scraped.get("ISBN13") or scraped.get("ISBN")
             body["ISBN"] = as_rich(isbn_value)
         
-        # Diğer text alanlar
-        for key in ["Publisher", "Language"]:
+        # Text alanlar (Description dahil!)
+        for key in ["Publisher", "Language", "Description"]:
             val = scraped.get(key)
             if val:
                 body[key] = as_rich(val)
@@ -164,25 +162,24 @@ def _build_updates(
             if not existing_rating:
                 body["Average Rating"] = as_number(scraped["Average Rating"])
 
-        # Author: Multi-select (sadece boş ise)
+        # Multi-select alanlar
         existing_author = _get_prop_value(existing_props.get("Author"))
         if scraped.get("Author") and not existing_author:
             body["Author"] = as_multi_select(scraped["Author"])
         
-        # Additional Authors: Multi-select (sadece boş ise)
         existing_additional = _get_prop_value(existing_props.get("Additional Authors"))
         if scraped.get("Additional Authors") and not existing_additional:
             body["Additional Authors"] = as_multi_select(scraped["Additional Authors"])
         
-        # ISBN: Tek kolon (sadece boş ise)
+        # ISBN
         existing_isbn = _get_prop_value(existing_props.get("ISBN"))
         if not existing_isbn:
             isbn_value = scraped.get("ISBN13") or scraped.get("ISBN")
             if isbn_value:
                 body["ISBN"] = as_rich(isbn_value)
         
-        # Diğer text alanlar
-        for key in ["Publisher", "Language"]:
+        # Text alanlar (Description dahil!)
+        for key in ["Publisher", "Language", "Description"]:
             existing_value = _get_prop_value(existing_props.get(key))
             scraped_value = scraped.get(key)
             

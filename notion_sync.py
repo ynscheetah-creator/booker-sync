@@ -1,164 +1,174 @@
 # -*- coding: utf-8 -*-
 """
-Notion <-> Goodreads (sadece Goodreads URL'inden) senk.
-Sadece AŞAĞIDAKİ KOLON ADLARINA yazar:
-
-- goodreadsURL (URL)
-- Book Id (number)
-- Title (rich_text)
-- Cover URL (url)
-- Author (rich_text)
-- Additional Authors (rich_text)
-- Publisher (rich_text)
-- Year Published (number)
-- Original Publication Year (number)
-- Number of Pages (number)
-- Language (rich_text veya select; ikisi de desteklenir)
-- ISBN (rich_text)
-- ISBN13 (rich_text)
-- Average Rating (number)
-
-Boş alanlara yazar. Hepsini ezmek için FORCE_UPDATE=true kullan.
+Notion sync for Goodreads rows:
+- Queries pages where `goodreadsURL` is set
+- Fills only empty/placeholder fields
+- Updates page cover with external cover URL
+- Handles property types dynamically
 """
 
+from __future__ import annotations
 import os
-from typing import Any, Dict
-
+from typing import Dict, Any, Optional, List
 from notion_client import Client
 from notion_client.helpers import iterate_paginated_api
+from goodreads_scraper import scrape_goodreads
 
-from goodreads_scraper import fetch_goodreads
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 
-NOTION_TOKEN   = os.getenv("NOTION_TOKEN")
-DATABASE_ID    = os.getenv("NOTION_DATABASE_ID")
-FORCE_UPDATE   = os.getenv("FORCE_UPDATE", "false").lower() == "true"
-USER_AGENT     = os.getenv("USER_AGENT", "")
+client = Client(auth=NOTION_TOKEN)
 
-c = Client(auth=NOTION_TOKEN)
+# Kullanıcı "placeholder"ları – bunları görünce üzerine yazarız.
+PLACEHOLDERS = {"goodreads", "authors", "author", "good reads", "title", "publisher"}
 
-# Notion sütun adları
-COLS = [
-    "goodreadsURL",
-    "Book Id",
-    "Title",
-    "Cover URL",
-    "Author",
-    "Additional Authors",
-    "Publisher",
-    "Year Published",
-    "Original Publication Year",
-    "Number of Pages",
-    "Language",
-    "ISBN",
-    "ISBN13",
-    "Average Rating",
-]
+RICH_TEXT_LIMIT = 2000
 
-def _empty(prop: Dict[str, Any]) -> bool:
-    if not prop:
+# ---- Yardımcılar -----------------------------------------------------------
+
+def _plain_from_title(prop: Dict[str, Any]) -> str:
+    parts = prop.get("title", [])
+    return "".join(p.get("plain_text", "") for p in parts).strip()
+
+def _plain_from_rich(prop: Dict[str, Any]) -> str:
+    parts = prop.get("rich_text", [])
+    return "".join(p.get("plain_text", "") for p in parts).strip()
+
+def _is_placeholder(txt: Optional[str]) -> bool:
+    if not txt:
         return True
-    if "url" in prop:
-        return not prop.get("url")
-    if "number" in prop:
-        return prop.get("number") is None
-    if "select" in prop:
-        return prop.get("select") is None
-    if "title" in prop:
-        return not "".join([t.get("plain_text","") for t in prop["title"]]).strip()
-    if "rich_text" in prop:
-        return not "".join([t.get("plain_text","") for t in prop["rich_text"]]).strip()
-    return True
+    t = txt.strip().lower()
+    return t in PLACEHOLDERS
 
-def _encode(schema: Dict[str, Any], value: Any) -> Dict[str, Any]:
-    if value in (None, ""):
-        return {}
-    if isinstance(value, str):
-        value = value.strip()
-    if "title" in schema:
-        return {"title": [{"type": "text", "text": {"content": str(value)}}]}
-    if "rich_text" in schema:
-        return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
-    if "url" in schema:
-        return {"url": str(value)}
-    if "number" in schema:
-        try: return {"number": float(value)}
-        except Exception: return {}
-    if "select" in schema:
-        return {"select": {"name": str(value)}}
-    return {}
+def _truncate(txt: Optional[str], limit: int = RICH_TEXT_LIMIT) -> Optional[str]:
+    if not txt:
+        return None
+    if len(txt) <= limit:
+        return txt
+    return txt[: limit - 1] + "…"
 
-def _updates(schema: Dict[str, Any], scraped: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
-    up: Dict[str, Any] = {}
-    for col in COLS:
-        if col not in schema:    # Notion’da yoksa atla
-            continue
-        if col not in scraped:   # Scraper üretmediyse atla
-            continue
-        if not (FORCE_UPDATE or _empty(current.get(col))):
-            continue
+def _set_prop(payload: Dict[str, Any], name: str, v: Any, ptype: str):
+    """
+    Şemadaki tipe göre property değerini hazırlar.
+    """
+    if v is None or v == "":
+        return
 
-        val = scraped[col]
-        # Güvenlik: Publisher çok uzun olmasın
-        if col == "Publisher" and isinstance(val, str):
-            val = val[:200]
-        if col == "Title" and isinstance(val, str):
-            val = val[:1000]
+    if ptype == "title":
+        payload[name] = {"title": [{"type": "text", "text": {"content": str(v)}}]}
+    elif ptype == "rich_text":
+        payload[name] = {"rich_text": [{"type": "text", "text": {"content": _truncate(str(v))}}]}
+    elif ptype == "url":
+        payload[name] = {"url": str(v)}
+    elif ptype == "number":
+        try:
+            payload[name] = {"number": float(v) if v is not None else None}
+        except Exception:
+            # metin gelirse dokunma
+            pass
+    elif ptype == "select":
+        payload[name] = {"select": {"name": str(v)}}
+    else:
+        # diğer tipler (multi_select vs.) için basit rich_text fallback
+        payload[name] = {"rich_text": [{"type": "text", "text": {"content": _truncate(str(v))}}]}
 
-        enc = _encode(schema[col], val)
-        if enc:
-            up[col] = enc
-    return up
+def _get_prop_type(db_schema: Dict[str, Any], name: str) -> Optional[str]:
+    p = db_schema.get("properties", {}).get(name)
+    return p.get("type") if p else None
 
-def _apply_cover(page: Dict[str, Any], scraped: Dict[str, Any]) -> Dict[str, Any]:
-    url = scraped.get("coverURL")
-    if not url or not isinstance(url, str) or not url.startswith(("http://","https://")):
-        return {}
-    # kapağı sadece boşsa ya da FORCE_UPDATE açıkken yaz
-    if page.get("cover") is None or FORCE_UPDATE:
-        return {"cover": {"type": "external", "external": {"url": url}}}
-    return {}
+def _current_text(page_prop: Dict[str, Any]) -> str:
+    t = page_prop.get("type")
+    if t == "title":
+        return _plain_from_title(page_prop)
+    if t == "rich_text":
+        return _plain_from_rich(page_prop)
+    if t == "url":
+        return page_prop.get("url") or ""
+    if t == "number":
+        n = page_prop.get("number")
+        return "" if n is None else str(n)
+    return ""
 
-def run_once() -> None:
-    # sadece goodreadsURL dolu & /book/show/ içeren tüm sayfalar
-    pages_iter = iterate_paginated_api(
-        c.databases.query,
-        database_id=DATABASE_ID,
+def _should_update(current_text: str) -> bool:
+    return (not current_text) or _is_placeholder(current_text)
+
+# ---- Çek & Güncelle -------------------------------------------------------
+
+def query_candidate_pages() -> List[Dict[str, Any]]:
+    """
+    goodreadsURL dolu olan tüm sayfaları getir.
+    Filtreyi geniş bıraktık, alan bazlı karar sayfa üstünde veriliyor.
+    """
+    pages = []
+    for page in iterate_paginated_api(
+        client.databases.query, database_id=DATABASE_ID,
         filter={
-            "and":[
-                {"property":"goodreadsURL","url":{"is_not_empty":True}},
-                {"property":"goodreadsURL","url":{"contains":"/book/show/"}},
-            ]
-        },
-        page_size=100,
-    )
+            "property": "goodreadsURL",
+            "url": {"is_not_empty": True}
+        }
+    ):
+        pages.append(page)
+    return pages
 
-    for page in pages_iter:
-        pid = page["id"]
-        props = page["properties"]
-        gr = props.get("goodreadsURL",{}).get("url")
-        if not gr:
+def build_updates(db_schema: Dict[str, Any], page: Dict[str, Any], scraped: Dict[str, Any]) -> Dict[str, Any]:
+    props = page["properties"]
+    out: Dict[str, Any] = {}
+
+    # db’de olan property’lere bakıp tek tek karar veriyoruz:
+    for k_notion, v in scraped.items():
+        if k_notion not in props:
+            continue  # veritabanında bu kolon yok
+        ptype = _get_prop_type(db_schema, k_notion)
+        cur = _current_text(props[k_notion])
+        if _should_update(cur):
+            _set_prop(out, k_notion, v, ptype)
+
+    # Title kolonunun adı “Title” ve type=title ise özellikle doldur.
+    if "Title" in props and "Title" in scraped:
+        ptype = _get_prop_type(db_schema, "Title")
+        cur = _current_text(props["Title"])
+        if _should_update(cur):
+            _set_prop(out, "Title", scraped["Title"], ptype)
+
+    return out
+
+def update_page_cover(page_id: str, cover_url: Optional[str]):
+    if not cover_url:
+        return
+    try:
+        client.pages.update(
+            page_id=page_id,
+            cover={"type": "external", "external": {"url": cover_url}}
+        )
+    except Exception:
+        pass
+
+def run_once():
+    db_schema = client.databases.retrieve(database_id=DATABASE_ID)
+    pages = query_candidate_pages()
+
+    for pg in pages:
+        page_id = pg["id"]
+        props = pg["properties"]
+
+        gr = props.get("goodreadsURL", {})
+        url_val = gr.get("url") if gr.get("type") == "url" else None
+        if not url_val:
             continue
 
         # scrape
-        try:
-            data = fetch_goodreads(gr, ua=USER_AGENT) or {}
-        except Exception as e:
-            print(f"ERR fetch {gr}: {e}")
-            continue
+        data = scrape_goodreads(url_val).to_notion_payload_dict()
 
-        # scraped anahtarlarını Notion kolonlarına aynı isimle bırakıyoruz
-        # (goodreads_scraper zaten bu isimlerle döndürüyor)
-        updates = _updates(props, data, props)
-        cover   = _apply_cover(page, data)
+        # güncelleme payload’u
+        payload = build_updates(db_schema, pg, data)
 
-        if updates or cover:
-            try:
-                c.pages.update(page_id=pid, properties=updates or {}, **cover)
-                print(f"Updated {pid}")
-            except Exception as e:
-                print(f"ERR update {pid}: {e}")
+        # göndermek üzere property’ler varsa güncelle
+        if payload:
+            client.pages.update(page_id=page_id, properties=payload)
+
+        # kapak
+        update_page_cover(page_id, data.get("Cover URL"))
+
 
 if __name__ == "__main__":
-    if not NOTION_TOKEN or not DATABASE_ID:
-        raise SystemExit("NOTION_TOKEN / NOTION_DATABASE_ID eksik.")
     run_once()

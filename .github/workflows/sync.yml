@@ -16,23 +16,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Chrome
-        run: |
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-
-      - name: Install ChromeDriver
-        run: |
-          CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d '.' -f 1)
-          wget -O /tmp/chromedriver.zip https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_VERSION}
-          DRIVER_VERSION=$(cat /tmp/chromedriver.zip)
-          wget -O /tmp/chromedriver.zip https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/chromedriver_linux64.zip
-          unzip /tmp/chromedriver.zip -d /tmp/
-          sudo mv /tmp/chromedriver /usr/local/bin/
-          sudo chmod +x /usr/local/bin/chromedriver
-
       - name: Install deps
         run: |
           python -m venv .venv
@@ -47,12 +30,3 @@ jobs:
         run: |
           source .venv/bin/activate
           python main.py
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: error-logs
-          path: |
-            *.log
-            *.txt

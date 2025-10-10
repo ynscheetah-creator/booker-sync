@@ -57,22 +57,31 @@ def _fallback_title(soup: BeautifulSoup) -> Optional[str]:
 
 def _fallback_author(soup: BeautifulSoup) -> Optional[str]:
     # yeni arayüz çeşitleri
-    sels = [
+    selectors = [
         '[data-testid="name"]',
+        '.ContributorLink__name',
         'a[data-testid="authorName"]',
-        '.ContributorLink__name',     # yeni sınıf isimleri
+        'a[href*="/author/"] span',
+        'a[href*="/author/"]',
     ]
-    els = None
-    for sel in sels:
+    els = []
+    for sel in selectors:
         els = soup.select(sel)
         if els:
             break
     if not els:
         # klasik
         els = soup.select("a.authorName span") or soup.select("a.authorName")
-    if els:
-        parts = [_clean(e.get_text()) for e in els]
-        return ", ".join([p for p in parts if p])
+    names = [_clean(e.get_text()) for e in els]
+    names = [n for n in names if n and not n.lower().startswith("goodreads")]
+    if names:
+        # tekilleştir
+        seen, uniq = set(), []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                uniq.append(n)
+        return ", ".join(uniq)
     return None
 
 def _fallback_isbn(soup: BeautifulSoup, html: str) -> Optional[str]:
@@ -94,17 +103,14 @@ def _fallback_pages(soup: BeautifulSoup, html: str) -> Optional[int]:
     el = soup.find(attrs={"itemprop": "numberOfPages"})
     if el and _clean(el.get_text()):
         return _to_int(el.get_text())
-    # 138 pages / 138 pages / 138 page / 138 sayfa
     m = re.search(r'(\d{1,4})\s*(?:pages?|sayfa)\b', html, flags=re.I)
     return int(m.group(1)) if m else None
 
 def _fallback_publisher_year_from_block(block: str) -> (Optional[str], Optional[int]):
-    """'This edition' veya benzeri dar blok içinde Published satırından çıkar."""
     pub = None
     year = None
     if not block:
         return pub, year
-    # Published ... 1952 ... by Varlık Yayınları
     my = re.search(r'Published[^<\n]*?\b(1[5-9]\d{2}|20\d{2})\b', block, flags=re.I)
     if my:
         year = int(my.group(1))
@@ -116,19 +122,15 @@ def _fallback_publisher_year_from_block(block: str) -> (Optional[str], Optional[
 def _fallback_language_from_block(block: str) -> Optional[str]:
     if not block:
         return None
-    # Language: Turkish
     ml = re.search(r'Language[^:<\n]*[:>]\s*([A-Za-zÇĞİÖŞÜçğıöşü\- ]+)', block, flags=re.I)
     if ml:
         return _clean(ml.group(1))
     return None
 
+
 # -------------------- ana fonksiyon --------------------
 
 def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
-    """
-    Goodreads kitap sayfasından başlık, yazar, yıl, yayınevi, sayfa sayısı, ISBN,
-    açıklama ve kapak görseli URL'sini döndürür.
-    """
     headers = {
         "User-Agent": ua or "Mozilla/5.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -146,7 +148,7 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
     soup = BeautifulSoup(r.text, "html.parser")
     html = r.text
 
-    # canonical kitap linkine geç (kısaltılmış/yan URL'lerde)
+    # canonical kitap linkine geç
     canon = soup.find("link", attrs={"rel": "canonical"})
     if canon and canon.has_attr("href"):
         href = canon["href"]
@@ -186,12 +188,11 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
     # Publisher & Year (önce dar blokta dene)
     pub, year = _fallback_publisher_year_from_block(details)
     if not year:
-        # “First published … 1933” gibi satırdan yıl
         mf = re.search(r'First published[^<\n]*?\b(1[5-9]\d{2}|20\d{2})\b', html, flags=re.I)
         if mf:
             year = int(mf.group(1))
     if not pub:
-        # geniş fallback (riskli ama son çare)
+        # geniş fallback (son çare)
         p2, y2 = _fallback_publisher_year_from_block(html)
         pub = pub or p2
         year = year or y2
@@ -205,9 +206,7 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
     # Language
     lang = _clean(jd.get("inLanguage")) or _fallback_language_from_block(details or html)
     if lang:
-        lang = lang.title() if len(lang) < 6 else lang  # Turkish / English vs.
-        # normalize tek kelimeyi büyük harfe çevirmek istemeyebiliriz
-        lang = _clean(lang)
+        lang = _clean(lang.title() if len(lang) < 6 else lang)
 
     # Description
     description = _clean(jd.get("description")) or desc
@@ -235,7 +234,6 @@ def fetch_goodreads(url: str, ua: Optional[str] = None) -> Dict:
         "source": "goodreads",
     }
 
-    # tamamen boşsa veri dönme
     if not any([title, author, cover, isbn13]):
         print(f"WARN could not parse GR: {url}")
         return {}

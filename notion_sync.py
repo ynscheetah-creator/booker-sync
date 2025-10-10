@@ -59,16 +59,14 @@ def build_updates(schema: Dict[str, Any], data: Dict[str, Any], current: Dict[st
     return updates
 
 def query_targets() -> Dict[str, Any]:
-    """
-    Goodreads linki girilmiş olan ve (Title ya da Author boş) satırları getir.
-    Dilersen genişlet: başka alanlar da boşsa doldurur.
-    """
     c = client()
     return c.databases.query(
         database_id=DATABASE_ID,
         filter={
             "and":[
                 {"property":"goodreadsURL","url":{"is_not_empty":True}},
+                # >>> sadece gerçek kitap sayfası:
+                {"property":"goodreadsURL","url":{"contains":"/book/show/"}},
                 {"or":[
                     {"property":"Title","title":{"is_empty":True}},
                     {"property":"Author","rich_text":{"is_empty":True}},

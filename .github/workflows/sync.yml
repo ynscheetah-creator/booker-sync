@@ -1,57 +1,32 @@
-name: Sync Goodreads → Notion
+name: Sync Notion (Books)
 
 on:
-  # Elle çalıştırma
   workflow_dispatch:
-    inputs:
-      note:
-        description: "Çalıştır: DB'de goodreadsURL dolu olan sayfaları zenginleştirir"
-        required: false
-        default: "Run sync"
-  # İstersen değiştir: her 30 dakikada bir
   schedule:
-    - cron: "*/30 * * * *"
-  # Kod/requirements değişince otomatik tetiklemek istersen:
-  push:
-    paths:
-      - "notion_sync.py"
-      - "goodreads_scraper.py"
-      - "requirements.txt"
-      - ".github/workflows/sync.yml"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: sync-goodreads-to-notion
-  cancel-in-progress: false
+    - cron: "0 */6 * * *"  # 6 saatte bir
 
 jobs:
   sync:
-    name: Run sync
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      # Zorunlu env değişkenleri (Repo Secrets bölümü)
-      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-      # 403 riskini azaltmak için gerçek bir tarayıcı UA ekleyin
-      USER_AGENT: ${{ secrets.USER_AGENT }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync (scan DB & update pages)
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          USER_AGENT: ${{ secrets.USER_AGENT }}
         run: |
-          python notion_sync.py
+          source .venv/bin/activate
+          python main.py

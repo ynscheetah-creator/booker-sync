@@ -193,4 +193,27 @@ def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
     # ---------- ISBN / ISBN13 – JSON-LD fallback ----------
     if not details.get("ISBN") and isinstance(ld.get("isbn"), str):
         details["ISBN"] = _clean(ld["isbn"])
-    if not details.get("
+    if not details.get("ISBN13") and isinstance(ld.get("isbn13"), str):
+        details["ISBN13"] = _clean(ld["isbn13"])
+
+    # ---------- Year Published – JSON-LD fallback ----------
+    if not details.get("Year Published") and isinstance(ld.get("datePublished"), str):
+        y = re.search(r"(20\d{2}|19\d{2})", ld["datePublished"])
+        if y:
+            details["Year Published"] = y.group(1)
+
+    # ---------- Sonuç ----------
+    return {
+        "goodreadsURL": url,
+        "Book Id": book_id,
+        "Title": title,
+        "Author": author,
+        "Publisher": details.get("Publisher"),
+        "Year Published": details.get("Year Published"),
+        "Original Publication Year": details.get("Original Publication Year"),
+        "Number of Pages": details.get("Number of Pages"),
+        "Language": details.get("Language"),
+        "ISBN": details.get("ISBN"),
+        "ISBN13": details.get("ISBN13"),
+        "Cover URL": cover,
+    }

@@ -37,6 +37,7 @@ def _prop_empty(prop: Dict[str, Any]) -> bool:
     if not prop:
         return True
 
+    # 👇 burası yer tutucular (placeholders) seti
     placeholders = {"goodreads", "authors", "author", "good reads"}
 
     # Page title property
@@ -49,7 +50,7 @@ def _prop_empty(prop: Dict[str, Any]) -> bool:
             return True
         return False
 
-    # Rich text property (sende Title bu tip)
+    # Rich text property (örneğin senin "Title" sütunun bu tip)
     if "rich_text" in prop:
         texts = [t.get("plain_text", "") for t in prop.get("rich_text", [])]
         text = "".join(texts).strip()

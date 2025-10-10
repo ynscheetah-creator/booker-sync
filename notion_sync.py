@@ -1,85 +1,95 @@
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 from notion_client import Client
 from utils import now_iso
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+DATABASE_ID  = os.getenv("NOTION_DATABASE_ID")
+OVERWRITE    = os.getenv("OVERWRITE", "false").lower() == "true"
 
-def notion_client() -> Client:
+def client() -> Client:
     if not NOTION_TOKEN:
         raise RuntimeError("NOTION_TOKEN missing")
     return Client(auth=NOTION_TOKEN)
 
-def _is_empty(prop: Dict[str, Any]) -> bool:
-    if "title" in prop:
-        return len(prop.get("title", [])) == 0
-    if "rich_text" in prop:
-        return len(prop.get("rich_text", [])) == 0
-    if "number" in prop:
-        return prop.get("number") is None
-    if "url" in prop:
-        return not prop.get("url")
-    if "select" in prop:
-        return prop.get("select") is None
-    if "date" in prop:
-        return prop.get("date") is None
-    return True
-
-def _encode_value_for(prop: Dict[str, Any], value):
-    # Prop tipine göre doğru JSON şeması döndür
+def _enc(schema: Dict[str, Any], value):
     if value in (None, ""):
         return None
-    if "title" in prop:
+    if "title" in schema:
         return {"title": [{"type": "text", "text": {"content": str(value)}}]}
-    if "rich_text" in prop:
+    if "rich_text" in schema:
         return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
-    if "number" in prop:
-        try:
-            return {"number": int(value)}
-        except Exception:
-            return None
-    if "url" in prop:
+    if "number" in schema:
+        try: return {"number": float(value)}
+        except Exception: return None
+    if "url" in schema:
         return {"url": str(value)}
-    if "select" in prop:
+    if "select" in schema:
         return {"select": {"name": str(value)}}
-    if "date" in prop:
+    if "date" in schema:
         return {"date": {"start": str(value)}}
     return None
 
-def update_page(page_id: str, data: Dict[str, Any]):
-    c = notion_client()
-    page = c.pages.retrieve(page_id=page_id)
-    props = page["properties"]
+def _is_empty(prop: Dict[str, Any]) -> bool:
+    if not prop: return True
+    if "title" in prop:     return len(prop.get("title", [])) == 0
+    if "rich_text" in prop: return len(prop.get("rich_text", [])) == 0
+    if "number" in prop:    return prop.get("number") is None
+    if "url" in prop:       return not prop.get("url")
+    if "select" in prop:    return prop.get("select") is None
+    return True
 
+ORDER = [
+    "Title","Author","Publisher","Language","Description",
+    "Number of Pages","Year Published","ISBN13","coverURL","Cover URL","goodreadsURL"
+]
+
+def build_updates(schema: Dict[str, Any], data: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     updates: Dict[str, Any] = {}
-
-    # Şu alanları işlemeye çalış
-    fields = [
-        ("Title", data.get("Title")),
-        ("Author", data.get("Author")),
-        ("Translator", data.get("Translator")),
-        ("Publisher", data.get("Publisher")),
-        ("Number of Pages", data.get("Number of Pages")),
-        ("coverURL", data.get("coverURL")),
-        ("Year Published", data.get("Year Published")),
-        ("Language", data.get("Language")),
-        ("Description", data.get("Description")),
-    ]
-    for key, val in fields:
-        if key in props and _is_empty(props[key]):
-            enc = _encode_value_for(props[key], val)
-            if enc:
-                updates[key] = enc
-
-    # LastSynced -> her zaman güncelle
-    if "LastSynced" in props:
+    for key in ORDER:
+        if key not in schema: 
+            continue
+        if not OVERWRITE and not _is_empty(current.get(key)):
+            continue
+        enc = _enc(schema[key], data.get(key))
+        if enc:
+            updates[key] = enc
+    if "LastSynced" in schema:
         updates["LastSynced"] = {"date": {"start": now_iso()}}
+    return updates
 
-    if updates:
-        c.pages.update(page_id=page_id, properties=updates)
+def query_targets() -> Dict[str, Any]:
+    """
+    Goodreads linki girilmiş olan ve (Title ya da Author boş) satırları getir.
+    Dilersen genişlet: başka alanlar da boşsa doldurur.
+    """
+    c = client()
+    return c.databases.query(
+        database_id=DATABASE_ID,
+        filter={
+            "and":[
+                {"property":"goodreadsURL","url":{"is_not_empty":True}},
+                {"or":[
+                    {"property":"Title","title":{"is_empty":True}},
+                    {"property":"Author","rich_text":{"is_empty":True}},
+                ]}
+            ]
+        },
+        page_size=100,
+    )
 
-def query_targets(limit: int = 100):
-    # Filtre yok; URL olmayanları main.py zaten atlıyor
-    c = notion_client()
-    return c.databases.query(database_id=DATABASE_ID, page_size=limit)
+def update_page(page_id: str, data: Dict[str, Any]):
+    c = client()
+    page   = c.pages.retrieve(page_id=page_id)
+    schema = page["properties"]
+
+    updates = build_updates(schema, data, current=schema)
+
+    # Kapak (Cover URL / coverURL ikisi de destek)
+    cover_url = data.get("Cover URL") or data.get("coverURL")
+    cover_payload = {}
+    if cover_url and (page.get("cover") is None or OVERWRITE):
+        cover_payload = {"cover": {"type": "external", "external": {"url": str(cover_url)}}}
+
+    if updates or cover_payload:
+        c.pages.update(page_id=page_id, properties=updates or {}, **cover_payload)

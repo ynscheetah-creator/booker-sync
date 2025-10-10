@@ -23,10 +23,12 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sync
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-        run: |
-          source .venv/bin/activate
-          python main.py
+# sync.yml - İsteğe bağlı zaman aralığı ayarlayın
+- name: Run sync
+  env:
+    NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+    NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+    RECENT_EDIT_HOURS: 6  # Son 6 saat (varsayılan)
+  run: |
+    source .venv/bin/activate
+    python main.py

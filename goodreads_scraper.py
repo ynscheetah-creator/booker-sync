@@ -43,6 +43,7 @@ def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
       Original Publication Year, Number of Pages, Language, ISBN,
       ISBN13, Average Rating, Cover URL, Book Id, goodreadsURL
     """
+    print(f"  🔍 Fetching: {url}")
     res = requests.get(url, headers=HEADERS, timeout=20)
     res.raise_for_status()
     soup = _make_soup(res.text)
@@ -154,4 +155,5 @@ def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
     if m:
         data["Original Publication Year"] = m.group(1)
 
+    print(f"  ✅ Scraped: {data['Title']}")
     return data

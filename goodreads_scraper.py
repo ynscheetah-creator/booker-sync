@@ -1,262 +1,196 @@
-# goodreads_scraper.py  —  v2 (strong fallbacks for title/author)
-
-from __future__ import annotations
-import json, re, os
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, List
+import re
+import json
+import html
+from typing import Dict, Optional
 import requests
 from bs4 import BeautifulSoup
 
-GOODREADS_BOOK_ID_RE = re.compile(r"/book/show/(\d+)")
+# Dışarıdan USER_AGENT .env / GitHub Secret ile gelmeli (workflow öyle ayarlı)
+from utils import get_user_agent
 
-def _ua() -> str:
-    return os.getenv(
-        "USER_AGENT",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": get_user_agent()})
 
-@dataclass
-class BookData:
-    goodreadsURL: Optional[str] = None
-    BookId: Optional[int] = None
-    Title: Optional[str] = None
-    CoverURL: Optional[str] = None
-    Author: Optional[str] = None
-    AdditionalAuthors: Optional[str] = None
-    Publisher: Optional[str] = None
-    YearPublished: Optional[int] = None
-    OriginalPublicationYear: Optional[int] = None
-    NumberOfPages: Optional[int] = None
-    Language: Optional[str] = None
-    ISBN: Optional[str] = None
-    ISBN13: Optional[str] = None
-    AverageRating: Optional[float] = None
-
-    def to_notion_payload_dict(self) -> Dict[str, Any]:
-        return {
-            "goodreadsURL": self.goodreadsURL,
-            "Book Id": self.BookId,
-            "Title": self.Title,
-            "Cover URL": self.CoverURL,
-            "Author": self.Author,
-            "Additional Authors": self.AdditionalAuthors,
-            "Publisher": self.Publisher,
-            "Year Published": self.YearPublished,
-            "Original Publication Year": self.OriginalPublicationYear,
-            "Number of Pages": self.NumberOfPages,
-            "Language": self.Language,
-            "ISBN": self.ISBN,
-            "ISBN13": self.ISBN13,
-            "Average Rating": self.AverageRating,
-        }
-
-def _clean(s: Optional[str]) -> Optional[str]:
-    if not s:
+# Yardımcılar
+def _clean(txt: Optional[str]) -> Optional[str]:
+    if not txt:
         return None
-    s = " ".join(s.split())
-    return s or None
+    t = html.unescape(txt).strip()
+    # Goodreads bazı alanlarda “=”” ... ”” gibi export formatına yakın dize üretir; normalize edelim
+    t = t.replace("\xa0", " ").replace("\u200b", "").strip()
+    return t or None
 
-def _first_str(x) -> Optional[str]:
-    if isinstance(x, str):
-        return x
-    if isinstance(x, dict):
-        if "name" in x:
-            return x.get("name")
-    if isinstance(x, list) and x:
-        v = x[0]
-        if isinstance(v, dict) and "name" in v:
-            return v.get("name")
-        if isinstance(v, str):
-            return v
-    return None
-
-def _extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
-    out: List[Dict[str, Any]] = []
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(tag.string or tag.text or "{}")
-            if isinstance(data, dict):
-                out.append(data)
-            elif isinstance(data, list):
-                out.extend([d for d in data if isinstance(d, dict)])
-        except Exception:
-            pass
-    for d in out:
-        t = d.get("@type")
-        if t == "Book" or (isinstance(t, list) and "Book" in t):
-            return d
-    return {}
+def _only_digits(txt: Optional[str]) -> Optional[str]:
+    if not txt:
+        return None
+    m = re.search(r"(\d+)", txt)
+    return m.group(1) if m else None
 
 def _meta(soup: BeautifulSoup, prop: str) -> Optional[str]:
-    tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
-    return _clean(tag["content"]) if tag and tag.has_attr("content") else None
+    tag = soup.find("meta", {"property": prop}) or soup.find("meta", {"name": prop})
+    return _clean(tag.get("content")) if tag and tag.get("content") else None
 
-def _book_id_from_url(url: str) -> Optional[int]:
-    m = GOODREADS_BOOK_ID_RE.search(url)
-    if m:
+def _first_text(soup: BeautifulSoup, selector: str) -> Optional[str]:
+    el = soup.select_one(selector)
+    return _clean(el.get_text(" ", strip=True)) if el else None
+
+def _jsonld(soup: BeautifulSoup) -> Dict:
+    out = {}
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
         try:
-            return int(m.group(1))
+            data = json.loads(script.string or "{}")
         except Exception:
-            return None
-    return None
+            continue
+        # Bazı sayfalarda Liste dönebiliyor
+        if isinstance(data, list):
+            for d in data:
+                if isinstance(d, dict) and d.get("@type") in {"Book", "CreativeWork"}:
+                    out.update(d)
+        elif isinstance(data, dict) and data.get("@type") in {"Book", "CreativeWork"}:
+            out.update(data)
+    return out
 
-# ---------- NEW: strong fallbacks for title/author ----------
+# TR/EN etiket haritası (detay kutularında “infoBoxRowTitle” alanı)
+LABEL_MAP = {
+    # publisher
+    "publisher": "Publisher",
+    "yayıncı": "Publisher",
+    "yayınevi": "Publisher",
+    # year published (genelde “Published … 1952” veya TR’de “Yayın tarihi … 1952”)
+    "published": "Year Published",
+    "yayın tarihi": "Year Published",
+    "basım tarihi": "Year Published",
+    # original title / original publication year
+    "original title": "Original Title",
+    "orijinal adı": "Original Title",
+    "orijinal ad": "Original Title",
+    "original publication year": "Original Publication Year",
+    "orijinal yayın yılı": "Original Publication Year",
+    # number of pages
+    "pages": "Number of Pages",
+    "sayfa": "Number of Pages",
+    # language
+    "language": "Language",
+    "dil": "Language",
+    # isbn
+    "isbn": "ISBN",
+    "isbn13": "ISBN13",
+}
 
-def _fallback_title(soup: BeautifulSoup) -> Optional[str]:
-    # 1) og:title (çoğu sayfada: "Title by Author — Goodreads")
-    ogt = _meta(soup, "og:title")
-    if ogt:
-        # " — Goodreads" / " - Goodreads" / " | Goodreads" ayracı
-        for sep in (" — Goodreads", " - Goodreads", " | Goodreads"):
-            if sep in ogt:
-                ogt = ogt.split(sep, 1)[0]
-                break
-        # " by " varsa, soldaki kısım başlık
-        if " by " in ogt:
-            ogt = ogt.split(" by ", 1)[0]
-        if ogt.strip():
-            return _clean(ogt)
+def _normalize_label(raw: str) -> str:
+    key = raw.strip().lower()
+    # iki kelimeli eşleşmeleri kolaylaştır
+    key = key.replace(":", "").replace("  ", " ")
+    return LABEL_MAP.get(key, raw)
 
-    # 2) sayfa <title>
-    t = soup.find("title")
-    if t and _clean(t.text):
-        tt = _clean(t.text)
-        for sep in (" — Goodreads", " - Goodreads", " | Goodreads"):
-            if sep in tt:
-                tt = tt.split(sep, 1)[0]
-                break
-        if " by " in tt:
-            tt = tt.split(" by ", 1)[0]
-        if tt.strip():
-            return _clean(tt)
+def _parse_details_box(soup: BeautifulSoup) -> Dict[str, str]:
+    """
+    Sağ taraftaki “Book details / Detaylar” kutusundan (infoBox) değerleri oku.
+    Goodreads teması zamanla değişebildiği için hem eski hem yeni sınıfları dener.
+    """
+    out: Dict[str, str] = {}
 
-    # 3) Görsel başlık h1 – yeni UI’de sık kullanılıyor
-    h1 = soup.select_one('h1[data-testid="bookTitle"], h1')
-    if h1 and _clean(h1.text):
-        return _clean(h1.text)
+    # 1) Eski “bookDataBox”
+    for row in soup.select("#bookDataBox .clearFloats"):
+        label_el = row.select_one(".infoBoxRowTitle")
+        value_el = row.select_one(".infoBoxRowItem")
+        if not label_el or not value_el:
+            continue
+        label = _normalize_label(label_el.get_text(" ", strip=True))
+        value = _clean(value_el.get_text(" ", strip=True))
+        if not label or not value:
+            continue
 
-    return None
+        if label in {"ISBN", "ISBN13"}:
+            # ISBN alanlarında bazen “978975768427 (ISBN13: 978975…)” gibi ek yazılar oluyor
+            value = value.replace("ISBN13:", "").strip()
+            value = re.sub(r"[^\dXx\- ]", "", value)  # harf kalsın (X) ama gürültüyü at
+            value = value.replace(" ", "")
+        elif label == "Number of Pages":
+            value = _only_digits(value)
+        out[label] = value
 
-def _fallback_author(soup: BeautifulSoup) -> Optional[str]:
-    # 1) meta name="author"
-    ma = _meta(soup, "author")
-    if ma:
-        return _clean(ma)
+    # 2) Yeni “Details” / #details alanı – microdata
+    # Sayfa sayısı
+    val = _first_text(soup, "#details span[itemprop='numberOfPages']")
+    if val and "Number of Pages" not in out:
+        out["Number of Pages"] = _only_digits(val)
 
-    # 2) og:title "Title by Author" ise sağ taraf
-    ogt = _meta(soup, "og:title")
-    if ogt and " by " in ogt:
-        right = ogt.split(" by ", 1)[1]
-        # sondaki " — Goodreads" vb. at
-        for sep in (" — Goodreads", " - Goodreads", " | Goodreads"):
-            if sep in right:
-                right = right.split(sep, 1)[0]
-                break
-        if right.strip():
-            return _clean(right)
+    # Yayın yılı (datePublished)
+    # Bazı sayfalarda #details içinde role=contentinfo bölgesinde geçiyor
+    date_pub = _first_text(soup, "#details span[itemprop='datePublished']") or \
+               _first_text(soup, "#details div:contains('Published')")
+    if date_pub:
+        # sadece yıl
+        y = re.search(r"(20\d{2}|19\d{2})", date_pub)
+        if y and "Year Published" not in out:
+            out["Year Published"] = y.group(1)
 
-    # 3) author link’leri (yeni UI): /author/show/.. içeren ilk link
-    a = soup.select_one('a[href*="/author/show/"]')
-    if a and _clean(a.text):
-        return _clean(a.text)
+    # Dil
+    lang = _first_text(soup, "#details div[itemprop='inLanguage'], #details span[itemprop='inLanguage']")
+    if lang and "Language" not in out:
+        out["Language"] = lang
 
-    # 4) data-testid ile name
-    a2 = soup.select_one('a[data-testid="name"]')
-    if a2 and _clean(a2.text):
-        return _clean(a2.text)
+    # Publisher (microdata ile)
+    pub = _first_text(soup, "#details [itemprop='publisher'] [itemprop='name'], #details [itemprop='publisher']")
+    if pub and "Publisher" not in out:
+        out["Publisher"] = pub
 
-    return None
+    return out
 
-# ------------------------------------------------------------
+def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
+    # URL normalize / Book Id çıkar
+    m = re.search(r"/book/show/(\d+)", url)
+    book_id = m.group(1) if m else None
 
-def scrape_goodreads(url: str) -> BookData:
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": _ua(),
-        # TR sayfalar için Türkçe de ekleyelim
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    })
-    resp = sess.get(url, timeout=30)
-    resp.raise_for_status()
+    r = SESSION.get(url, timeout=25)
+    r.raise_for_status()
 
-    final_url = resp.url
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    jsonld = _extract_jsonld(soup)
+    # Önce JSON-LD (varsa)
+    ld = _jsonld(soup)
 
-    # Title
-    title = _clean(jsonld.get("name")) or _fallback_title(soup)
+    # ---------- Title ----------
+    title = ld.get("name") if isinstance(ld.get("name"), str) else None
+    if not title:
+        title = _meta(soup, "og:title") \
+            or _first_text(soup, "h1#bookTitle, h1.Text__title1, h1.BookPageTitleSection__title")
+    title = _clean(title)
 
-    # Author
-    author = _first_str(jsonld.get("author")) or _fallback_author(soup)
-    author = _clean(author)
+    # ---------- Author ----------
+    # JSON-LD
+    author = None
+    if isinstance(ld.get("author"), dict):
+        author = ld["author"].get("name")
+    elif isinstance(ld.get("author"), list) and ld["author"]:
+        # ilk yazar
+        a0 = ld["author"][0]
+        if isinstance(a0, dict):
+            author = a0.get("name")
+    # Microdata / eski şablon
+    if not author:
+        author = _first_text(soup, "a.authorName span[itemprop='name'], a.ContributorLink, span[itemprop='author'] [itemprop='name']")
 
-    # Cover
-    cover = _meta(soup, "og:image")
+    # ---------- Cover ----------
+    cover = _meta(soup, "og:image") or _first_text(soup, "img#coverImage") or _first_text(soup, "img.BookCover__image")
+    # Eğer metinden geldiyse <img> için src alalım
+    if cover and cover.startswith(("http", "https")) is False:
+        img = soup.select_one("img#coverImage, img.BookCover__image")
+        if img and img.get("src"):
+            cover = img["src"]
 
-    # Publisher, YearPublished
-    publisher = _clean(_first_str(jsonld.get("publisher")))
-    year_published = None
-    dp = _first_str(jsonld.get("datePublished"))
-    if dp:
-        m = re.search(r"\d{4}", dp)
-        if m:
-            year_published = int(m.group(0))
+    # ---------- Detay kutuları ----------
+    details = _parse_details_box(soup)
 
-    original_year = None  # çoğu sayfada yok
+    # Dil yoksa TR/EN içeriğe göre tahmin (best-effort)
+    if not details.get("Language"):
+        # sayfa Türkçe ise gövde içinde “Sayfa” veya “Yayın tarihi” geçer
+        body_txt = soup.get_text(" ", strip=True).lower()
+        if " yay" in body_txt or "sayfa" in body_txt or "orijinal adı" in body_txt:
+            details["Language"] = "Turkish"
 
-    # Pages
-    pages = None
-    if jsonld.get("numberOfPages") is not None:
-        try:
-            pages = int(str(jsonld.get("numberOfPages")).strip())
-        except Exception:
-            pages = None
-
-    language = _clean(_first_str(jsonld.get("inLanguage")))
-
-    # ISBN / ISBN13
-    isbn10, isbn13 = None, None
-    isb = _clean(_first_str(jsonld.get("isbn")))
-    if isb:
-        digits = re.sub(r"[^0-9Xx]", "", isb)
-        if len(digits) == 13:
-            isbn13 = isb
-        elif len(digits) == 10:
-            isbn10 = isb
-
-    # Rating
-    rating = None
-    agg = jsonld.get("aggregateRating") or {}
-    if isinstance(agg, dict):
-        rv = agg.get("ratingValue")
-        try:
-            rating = float(rv)
-        except Exception:
-            pass
-
-    # Book Id
-    book_id = _book_id_from_url(final_url) or _book_id_from_url(url)
-
-    return BookData(
-        goodreadsURL=final_url,
-        BookId=book_id,
-        Title=title,
-        CoverURL=cover,
-        Author=author,
-        AdditionalAuthors=None,
-        Publisher=publisher,
-        YearPublished=year_published,
-        OriginalPublicationYear=original_year,
-        NumberOfPages=pages,
-        Language=language,
-        ISBN=isbn10,
-        ISBN13=isbn13,
-        AverageRating=rating,
-    )
-
-if __name__ == "__main__":
-    import sys, json as _json
-    u = sys.argv[1] if len(sys.argv) > 1 else "https://www.goodreads.com/book/show/13038020"
-    bd = scrape_goodreads(u).to_notion_payload_dict()
-    print(_json.dumps(bd, ensure_ascii=False, indent=2))
+    # ---------- ISBN / ISBN13 – JSON-LD fallback ----------
+    if not details.get("ISBN") and isinstance(ld.get("isbn"), str):
+        details["ISBN"] = _clean(ld["isbn"])
+    if not details.get("

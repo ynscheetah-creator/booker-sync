@@ -2,7 +2,9 @@
 import os
 from typing import Dict, Any, Optional
 from notion_client import Client
-from utils import get_env, as_title, as_rich, as_url, as_number, truncate
+from utils import (
+    get_env, as_title, as_rich, as_url, as_number, as_multi_select, truncate
+)
 from google_books_api import fetch_from_google_books
 from openlibrary_api import fetch_from_openlibrary
 import re
@@ -18,7 +20,6 @@ if not NOTION_TOKEN or not DATABASE_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 
-# Son kaç saat içinde düzenlenen sayfalar yeniden işlensin?
 RECENT_EDIT_HOURS = int(os.environ.get("RECENT_EDIT_HOURS", "24"))
 
 
@@ -38,6 +39,9 @@ def _get_prop_value(p: Dict[str, Any]) -> Optional[str]:
             return p["url"]
         if t == "number":
             return str(p["number"]) if p["number"] is not None else None
+        if t == "multi_select":
+            arr = p["multi_select"]
+            return ", ".join([x["name"] for x in arr]) if arr else None
     except Exception:
         return None
     return None
@@ -73,7 +77,6 @@ def _build_updates(
     """
     API'den gelen veriyi Notion update body'sine çevir.
     force_update=True ise tüm alanları güncelle (ISBN değişirse)
-    force_update=False ise sadece boş alanları doldur
     """
     body: Dict[str, Any] = {}
 
@@ -103,7 +106,21 @@ def _build_updates(
         if scraped.get("Average Rating"):
             body["Average Rating"] = as_number(scraped["Average Rating"])
         
-        for key in ["Author", "Additional Authors", "Publisher", "Language", "ISBN", "ISBN13"]:
+        # Author: Multi-select
+        if scraped.get("Author"):
+            body["Author"] = as_multi_select(scraped["Author"])
+        
+        # Additional Authors: Multi-select (çevirmenler vs)
+        if scraped.get("Additional Authors"):
+            body["Additional Authors"] = as_multi_select(scraped["Additional Authors"])
+        
+        # ISBN: Tek kolon
+        if scraped.get("ISBN13") or scraped.get("ISBN"):
+            isbn_value = scraped.get("ISBN13") or scraped.get("ISBN")
+            body["ISBN"] = as_rich(isbn_value)
+        
+        # Diğer text alanlar
+        for key in ["Publisher", "Language"]:
             val = scraped.get(key)
             if val:
                 body[key] = as_rich(val)
@@ -147,21 +164,30 @@ def _build_updates(
             if not existing_rating:
                 body["Average Rating"] = as_number(scraped["Average Rating"])
 
-        text_fields = {
-            "Author": "Author",
-            "Additional Authors": "Additional Authors",
-            "Publisher": "Publisher",
-            "Language": "Language",
-            "ISBN": "ISBN",
-            "ISBN13": "ISBN13",
-        }
+        # Author: Multi-select (sadece boş ise)
+        existing_author = _get_prop_value(existing_props.get("Author"))
+        if scraped.get("Author") and not existing_author:
+            body["Author"] = as_multi_select(scraped["Author"])
         
-        for field_name, prop_name in text_fields.items():
-            existing_value = _get_prop_value(existing_props.get(prop_name))
-            scraped_value = scraped.get(field_name)
+        # Additional Authors: Multi-select (sadece boş ise)
+        existing_additional = _get_prop_value(existing_props.get("Additional Authors"))
+        if scraped.get("Additional Authors") and not existing_additional:
+            body["Additional Authors"] = as_multi_select(scraped["Additional Authors"])
+        
+        # ISBN: Tek kolon (sadece boş ise)
+        existing_isbn = _get_prop_value(existing_props.get("ISBN"))
+        if not existing_isbn:
+            isbn_value = scraped.get("ISBN13") or scraped.get("ISBN")
+            if isbn_value:
+                body["ISBN"] = as_rich(isbn_value)
+        
+        # Diğer text alanlar
+        for key in ["Publisher", "Language"]:
+            existing_value = _get_prop_value(existing_props.get(key))
+            scraped_value = scraped.get(key)
             
             if scraped_value and not existing_value:
-                body[prop_name] = as_rich(scraped_value)
+                body[key] = as_rich(scraped_value)
 
     return {k: v for k, v in body.items() if v is not None}
 
@@ -171,7 +197,6 @@ def _set_page_cover(page_id: str, cover_url: Optional[str], force: bool = False)
     if not cover_url:
         return
     try:
-        # Force ise her zaman güncelle, değilse sadece cover yoksa ekle
         notion.pages.update(
             page_id=page_id,
             cover={"type": "external", "external": {"url": cover_url}},
@@ -186,13 +211,12 @@ def _needs_update(props: Dict[str, Any]) -> tuple[bool, str]:
     title = _get_prop_value(props.get("Title"))
     author = _get_prop_value(props.get("Author"))
     isbn = _get_prop_value(props.get("ISBN"))
-    isbn13 = _get_prop_value(props.get("ISBN13"))
     cover = _get_prop_value(props.get("Cover URL"))
     publisher = _get_prop_value(props.get("Publisher"))
     pages = _get_prop_value(props.get("Number of Pages"))
     year = _get_prop_value(props.get("Year Published"))
     
-    if not any([title, isbn, isbn13]):
+    if not any([title, isbn]):
         return False, "No basic info"
     
     if title:
@@ -213,7 +237,7 @@ def _needs_update(props: Dict[str, Any]) -> tuple[bool, str]:
         else:
             return False, "Complete"
     
-    if not title and (isbn or isbn13):
+    if not title and isbn:
         return True, "Has ISBN but no Title"
     
     return False, "Unknown"
@@ -223,7 +247,6 @@ def fetch_book_data(
     title: str = None,
     author: str = None,
     isbn: str = None,
-    isbn13: str = None,
     goodreads_url: str = None
 ) -> Dict[str, Optional[str]]:
     """API'lerden kitap verisi çek"""
@@ -235,18 +258,16 @@ def fetch_book_data(
             data["Book Id"] = book_id
             data["goodreadsURL"] = goodreads_url
     
-    search_isbn = isbn13 or isbn
-    
-    if search_isbn:
-        print(f"  🔍 Searching by ISBN: {search_isbn}")
+    if isbn:
+        print(f"  🔍 Searching by ISBN: {isbn}")
         
-        google_data = fetch_from_google_books(isbn=search_isbn)
+        google_data = fetch_from_google_books(isbn=isbn)
         if google_data and google_data.get("Title"):
             print(f"  ✅ Found in Google Books (ISBN): {google_data['Title']}")
             data.update({k: v for k, v in google_data.items() if v})
             return data
         
-        ol_data = fetch_from_openlibrary(isbn=search_isbn)
+        ol_data = fetch_from_openlibrary(isbn=isbn)
         if ol_data and ol_data.get("Title"):
             print(f"  ✅ Found in OpenLibrary (ISBN): {ol_data['Title']}")
             data.update({k: v for k, v in ol_data.items() if v})
@@ -305,14 +326,9 @@ def run_once():
         page_id = page["id"]
         props = page.get("properties", {})
 
-        # Son düzenlenme kontrolü
         recently_edited = _was_recently_edited(page, RECENT_EDIT_HOURS)
-        
-        # Normal güncelleme kontrolü
         needs_update, reason = _needs_update(props)
         
-        # Eğer son X saatte düzenlendiyse FORCE UPDATE
-        # Değilse normal update logic
         if not recently_edited and not needs_update:
             if reason == "Complete":
                 complete_count += 1
@@ -323,10 +339,9 @@ def run_once():
         existing_title = _get_prop_value(props.get("Title"))
         existing_author = _get_prop_value(props.get("Author"))
         existing_isbn = _get_prop_value(props.get("ISBN"))
-        existing_isbn13 = _get_prop_value(props.get("ISBN13"))
         gr_url = _get_prop_value(props.get("goodreadsURL")) or ""
 
-        display_name = existing_title or existing_isbn or existing_isbn13 or gr_url
+        display_name = existing_title or existing_isbn or gr_url
         print(f"[{idx}/{len(results)}] 📖 {display_name[:60]}")
         
         if recently_edited:
@@ -339,7 +354,6 @@ def run_once():
                 title=existing_title,
                 author=existing_author,
                 isbn=existing_isbn,
-                isbn13=existing_isbn13,
                 goodreads_url=gr_url if gr_url else None
             )
         except Exception as e:
@@ -347,7 +361,6 @@ def run_once():
             error_count += 1
             continue
 
-        # Force update ise tüm alanları, değilse sadece boş alanları güncelle
         updates = _build_updates(scraped, props, force_update=recently_edited)
 
         if not updates:
@@ -360,13 +373,10 @@ def run_once():
             updated_fields = list(updates.keys())
             print(f"  ✅ Updated {len(updated_fields)} fields: {', '.join(updated_fields[:5])}")
 
-            # Cover güncelle
             if recently_edited:
-                # Force update: her zaman üzerine yaz
                 _set_page_cover(page_id, scraped.get("Cover URL"), force=True)
                 force_updated_count += 1
             else:
-                # Normal: sadece yoksa ekle
                 existing_cover = _get_prop_value(props.get("Cover URL"))
                 if not existing_cover and scraped.get("Cover URL"):
                     _set_page_cover(page_id, scraped.get("Cover URL"))

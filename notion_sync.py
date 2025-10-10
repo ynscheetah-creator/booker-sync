@@ -1,174 +1,225 @@
-# -*- coding: utf-8 -*-
-"""
-Notion sync for Goodreads rows:
-- Queries pages where `goodreadsURL` is set
-- Fills only empty/placeholder fields
-- Updates page cover with external cover URL
-- Handles property types dynamically
-"""
-
+# notion_sync.py  —  v2 (placeholder-aware, safe updates, debug logs)
 from __future__ import annotations
-import os
-from typing import Dict, Any, Optional, List
+import os, re, sys, time
+from typing import Dict, Any, Optional
+
 from notion_client import Client
 from notion_client.helpers import iterate_paginated_api
-from goodreads_scraper import scrape_goodreads
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+from goodreads_scraper import scrape_goodreads, BookData
 
-client = Client(auth=NOTION_TOKEN)
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# Kullanıcı "placeholder"ları – bunları görünce üzerine yazarız.
-PLACEHOLDERS = {"goodreads", "authors", "author", "good reads", "title", "publisher"}
+if not NOTION_TOKEN or not DATABASE_ID:
+    print("ERROR: NOTION_TOKEN / NOTION_DATABASE_ID env eksik.")
+    sys.exit(1)
 
-RICH_TEXT_LIMIT = 2000
+notion = Client(auth=NOTION_TOKEN)
 
-# ---- Yardımcılar -----------------------------------------------------------
+# === Ayarlar ===
+# Sizin DB kolon adlarınız:
+COLS = {
+    "url": "goodreadsURL",              # URL
+    "book_id": "Book Id",               # number
+    "title": "Title",                   # title
+    "cover_url": "Cover URL",           # url
+    "author": "Author",                 # rich_text
+    "add_authors": "Additional Authors",# rich_text
+    "publisher": "Publisher",           # rich_text
+    "year_published": "Year Published", # number
+    "orig_year": "Original Publication Year", # number
+    "pages": "Number of Pages",         # number
+    "lang": "Language",                 # rich_text
+    "isbn": "ISBN",                     # rich_text
+    "isbn13": "ISBN13",                 # rich_text
+    "rating": "Average Rating",         # number
+}
 
-def _plain_from_title(prop: Dict[str, Any]) -> str:
-    parts = prop.get("title", [])
-    return "".join(p.get("plain_text", "") for p in parts).strip()
+# “Placeholder” gibi gördüğümüz başlık/yazar metinleri
+PLACEHOLDERS = {"goodreads", "authors", "author", "good reads"}
 
-def _plain_from_rich(prop: Dict[str, Any]) -> str:
-    parts = prop.get("rich_text", [])
-    return "".join(p.get("plain_text", "") for p in parts).strip()
-
-def _is_placeholder(txt: Optional[str]) -> bool:
-    if not txt:
+def _is_placeholder(s: Optional[str]) -> bool:
+    if not s:
         return True
-    t = txt.strip().lower()
-    return t in PLACEHOLDERS
+    return s.strip().lower() in PLACEHOLDERS
 
-def _truncate(txt: Optional[str], limit: int = RICH_TEXT_LIMIT) -> Optional[str]:
-    if not txt:
-        return None
-    if len(txt) <= limit:
-        return txt
-    return txt[: limit - 1] + "…"
-
-def _set_prop(payload: Dict[str, Any], name: str, v: Any, ptype: str):
-    """
-    Şemadaki tipe göre property değerini hazırlar.
-    """
-    if v is None or v == "":
-        return
-
-    if ptype == "title":
-        payload[name] = {"title": [{"type": "text", "text": {"content": str(v)}}]}
-    elif ptype == "rich_text":
-        payload[name] = {"rich_text": [{"type": "text", "text": {"content": _truncate(str(v))}}]}
-    elif ptype == "url":
-        payload[name] = {"url": str(v)}
-    elif ptype == "number":
-        try:
-            payload[name] = {"number": float(v) if v is not None else None}
-        except Exception:
-            # metin gelirse dokunma
-            pass
-    elif ptype == "select":
-        payload[name] = {"select": {"name": str(v)}}
+def _rt_get(prop: Dict[str, Any]) -> str:
+    # rich_text veya title alanından düz string oku
+    if not prop:
+        return ""
+    if "rich_text" in prop:
+        arr = prop.get("rich_text", [])
+    elif "title" in prop:
+        arr = prop.get("title", [])
     else:
-        # diğer tipler (multi_select vs.) için basit rich_text fallback
-        payload[name] = {"rich_text": [{"type": "text", "text": {"content": _truncate(str(v))}}]}
+        return ""
+    out = []
+    for r in arr:
+        t = r.get("plain_text")
+        if t:
+            out.append(t)
+    return " ".join(out).strip()
 
-def _get_prop_type(db_schema: Dict[str, Any], name: str) -> Optional[str]:
-    p = db_schema.get("properties", {}).get(name)
-    return p.get("type") if p else None
+def _prop_get_url(properties: Dict[str, Any], name: str) -> Optional[str]:
+    prop = properties.get(name, {})
+    if prop.get("type") == "url":
+        return prop.get("url")
+    return None
 
-def _current_text(page_prop: Dict[str, Any]) -> str:
-    t = page_prop.get("type")
-    if t == "title":
-        return _plain_from_title(page_prop)
-    if t == "rich_text":
-        return _plain_from_rich(page_prop)
-    if t == "url":
-        return page_prop.get("url") or ""
-    if t == "number":
-        n = page_prop.get("number")
-        return "" if n is None else str(n)
-    return ""
+def _prop_get_number(properties: Dict[str, Any], name: str) -> Optional[float]:
+    prop = properties.get(name, {})
+    if prop.get("type") == "number":
+        return prop.get("number")
+    return None
 
-def _should_update(current_text: str) -> bool:
-    return (not current_text) or _is_placeholder(current_text)
+def _prop_get_textlike(properties: Dict[str, Any], name: str) -> str:
+    prop = properties.get(name, {})
+    return _rt_get(prop)
 
-# ---- Çek & Güncelle -------------------------------------------------------
+def _truncate(s: Optional[str], limit: int = 1900) -> Optional[str]:
+    if not s:
+        return None
+    s = " ".join(s.split())
+    if len(s) > limit:
+        s = s[:limit]
+    return s
 
-def query_candidate_pages() -> List[Dict[str, Any]]:
-    """
-    goodreadsURL dolu olan tüm sayfaları getir.
-    Filtreyi geniş bıraktık, alan bazlı karar sayfa üstünde veriliyor.
-    """
-    pages = []
-    for page in iterate_paginated_api(
-        client.databases.query, database_id=DATABASE_ID,
-        filter={
-            "property": "goodreadsURL",
-            "url": {"is_not_empty": True}
+def _build_updates(page: Dict[str, Any], parsed: BookData) -> Dict[str, Any]:
+    """Boş/placeholder alanları parsed verilerle doldurur, Update payload döndürür."""
+    updates: Dict[str, Any] = {}
+
+    props = page.get("properties", {})
+
+    # --- Title
+    current_title = _prop_get_textlike(props, COLS["title"])
+    if _is_placeholder(current_title) and parsed.Title:
+        updates[COLS["title"]] = {
+            "title": [{"type": "text", "text": {"content": parsed.Title}}]
         }
-    ):
-        pages.append(page)
-    return pages
 
-def build_updates(db_schema: Dict[str, Any], page: Dict[str, Any], scraped: Dict[str, Any]) -> Dict[str, Any]:
-    props = page["properties"]
-    out: Dict[str, Any] = {}
+    # --- Author
+    current_author = _prop_get_textlike(props, COLS["author"])
+    if _is_placeholder(current_author) and parsed.Author:
+        updates[COLS["author"]] = {
+            "rich_text": [{"type": "text", "text": {"content": parsed.Author}}]
+        }
 
-    # db’de olan property’lere bakıp tek tek karar veriyoruz:
-    for k_notion, v in scraped.items():
-        if k_notion not in props:
-            continue  # veritabanında bu kolon yok
-        ptype = _get_prop_type(db_schema, k_notion)
-        cur = _current_text(props[k_notion])
-        if _should_update(cur):
-            _set_prop(out, k_notion, v, ptype)
+    # --- Additional Authors (eğer geliyorsa)
+    if parsed.AdditionalAuthors and not _prop_get_textlike(props, COLS["add_authors"]):
+        updates[COLS["add_authors"]] = {
+            "rich_text": [{"type": "text", "text": {"content": _truncate(parsed.AdditionalAuthors)}}]
+        }
 
-    # Title kolonunun adı “Title” ve type=title ise özellikle doldur.
-    if "Title" in props and "Title" in scraped:
-        ptype = _get_prop_type(db_schema, "Title")
-        cur = _current_text(props["Title"])
-        if _should_update(cur):
-            _set_prop(out, "Title", scraped["Title"], ptype)
+    # --- Publisher (uzun metin güvenliği)
+    if parsed.Publisher and not _prop_get_textlike(props, COLS["publisher"]):
+        updates[COLS["publisher"]] = {
+            "rich_text": [{"type": "text", "text": {"content": _truncate(parsed.Publisher)}}]
+        }
 
-    return out
+    # --- Year Published
+    if parsed.YearPublished is not None and _prop_get_number(props, COLS["year_published"]) is None:
+        updates[COLS["year_published"]] = {"number": parsed.YearPublished}
 
-def update_page_cover(page_id: str, cover_url: Optional[str]):
-    if not cover_url:
+    # --- Original Publication Year
+    if parsed.OriginalPublicationYear is not None and _prop_get_number(props, COLS["orig_year"]) is None:
+        updates[COLS["orig_year"]] = {"number": parsed.OriginalPublicationYear}
+
+    # --- Pages
+    if parsed.NumberOfPages is not None and _prop_get_number(props, COLS["pages"]) is None:
+        updates[COLS["pages"]] = {"number": parsed.NumberOfPages}
+
+    # --- Language
+    if parsed.Language and not _prop_get_textlike(props, COLS["lang"]):
+        updates[COLS["lang"]] = {
+            "rich_text": [{"type": "text", "text": {"content": _truncate(parsed.Language, 100)}}]
+        }
+
+    # --- ISBN & ISBN13
+    if parsed.ISBN and not _prop_get_textlike(props, COLS["isbn"]):
+        updates[COLS["isbn"]] = {
+            "rich_text": [{"type": "text", "text": {"content": parsed.ISBN}}]
+        }
+    if parsed.ISBN13 and not _prop_get_textlike(props, COLS["isbn13"]):
+        updates[COLS["isbn13"]] = {
+            "rich_text": [{"type": "text", "text": {"content": parsed.ISBN13}}]
+        }
+
+    # --- Rating
+    if parsed.AverageRating is not None and _prop_get_number(props, COLS["rating"]) is None:
+        updates[COLS["rating"]] = {"number": parsed.AverageRating}
+
+    # --- Cover URL (gözükmesi için)
+    current_cover = _prop_get_url(props, COLS["cover_url"])
+    if parsed.CoverURL and not current_cover:
+        updates[COLS["cover_url"]] = {"url": parsed.CoverURL}
+
+    # --- Book Id
+    current_bid = _prop_get_number(props, COLS["book_id"])
+    if parsed.BookId is not None and current_bid is None:
+        updates[COLS["book_id"]] = {"number": parsed.BookId}
+
+    return updates
+
+def update_page_cover_if_needed(page_id: str, page: Dict[str, Any], parsed: BookData):
+    # sayfa kapak resmi: parsed.CoverURL varsa ve mevcut cover yoksa set et
+    if not parsed.CoverURL:
         return
-    try:
-        client.pages.update(
-            page_id=page_id,
-            cover={"type": "external", "external": {"url": cover_url}}
-        )
-    except Exception:
-        pass
+    current_cover = page.get("cover")
+    if current_cover is None:
+        notion.pages.update(page_id=page_id, cover={"type": "external", "external": {"url": parsed.CoverURL}})
 
 def run_once():
-    db_schema = client.databases.retrieve(database_id=DATABASE_ID)
-    pages = query_candidate_pages()
+    # DB’de goodreadsURL dolu olan tüm sayfaları çek
+    # (Filtreyi daha daraltmak istersen: Title = "Goodreads" OR Author boş v.b. ekleyebilirsin)
+    print("Querying Notion database…")
+    pages = iterate_paginated_api(
+        notion.databases.query,
+        database_id=DATABASE_ID,
+        filter={
+            "property": COLS["url"],
+            "url": {"is_not_empty": True}
+        }
+    )
 
-    for pg in pages:
-        page_id = pg["id"]
-        props = pg["properties"]
-
-        gr = props.get("goodreadsURL", {})
-        url_val = gr.get("url") if gr.get("type") == "url" else None
-        if not url_val:
+    count = 0
+    for page in pages:
+        page_id = page["id"]
+        props = page.get("properties", {})
+        gr_url = _prop_get_url(props, COLS["url"])
+        if not gr_url:
             continue
 
-        # scrape
-        data = scrape_goodreads(url_val).to_notion_payload_dict()
+        print(f"\n--- PAGE {page_id} ---")
+        print(f"URL: {gr_url}")
 
-        # güncelleme payload’u
-        payload = build_updates(db_schema, pg, data)
+        try:
+            parsed = scrape_goodreads(gr_url)
+        except Exception as e:
+            print(f"SCRAPE ERROR: {e}")
+            continue
 
-        # göndermek üzere property’ler varsa güncelle
-        if payload:
-            client.pages.update(page_id=page_id, properties=payload)
+        # Debug log: çekilen veriyi göster
+        print("PARSED:", parsed.to_notion_payload_dict())
 
-        # kapak
-        update_page_cover(page_id, data.get("Cover URL"))
+        updates = _build_updates(page, parsed)
 
+        if updates:
+            try:
+                notion.pages.update(page_id=page_id, properties=updates)
+                print("Updated properties:", list(updates.keys()))
+            except Exception as e:
+                print("UPDATE ERROR:", e)
+
+        try:
+            update_page_cover_if_needed(page_id, page, parsed)
+        except Exception as e:
+            print("COVER ERROR:", e)
+
+        count += 1
+        time.sleep(0.5)  # Goodreads'e nazik davranalım
+
+    print(f"\nDone. Processed {count} pages.")
 
 if __name__ == "__main__":
     run_once()

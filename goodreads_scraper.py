@@ -1,131 +1,229 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-import re, html, time
-from typing import Dict, Optional
+"""
+Robust Goodreads scraper:
+- Prefers JSON-LD (schema.org/Book)
+- Falls back to OG meta for title/cover
+- Extracts Book Id from the URL
+"""
 
+from __future__ import annotations
+import json
+import re
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, List
+import os
 import requests
 from bs4 import BeautifulSoup
 
-def _ua(ua: Optional[str]) -> str:
-    return ua or ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36")
 
-def _clean(x: Optional[str]) -> str:
-    if not x: return ""
-    x = html.unescape(x)
-    return re.sub(r"\s+", " ", x).strip()
+GOODREADS_BOOK_ID_RE = re.compile(r"/book/show/(\d+)")
 
-def _int_year(s: str) -> Optional[int]:
-    m = re.search(r"(19|20)\d{2}", s or "")
-    return int(m.group(0)) if m else None
+def _ua() -> str:
+    return os.getenv(
+        "USER_AGENT",
+        # makul bir UA (GitHub Actions’ta 403 riskini azaltır)
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
 
-def _only_int(s: str) -> Optional[int]:
-    m = re.search(r"\d+", s or "")
-    return int(m.group(0)) if m else None
 
-def _sel_text(soup: BeautifulSoup, css: str) -> str:
-    el = soup.select_one(css)
-    return _clean(el.get_text(" ", strip=True)) if el else ""
+@dataclass
+class BookData:
+    goodreadsURL: Optional[str] = None
+    BookId: Optional[int] = None
+    Title: Optional[str] = None
+    CoverURL: Optional[str] = None
+    Author: Optional[str] = None
+    AdditionalAuthors: Optional[str] = None
+    Publisher: Optional[str] = None
+    YearPublished: Optional[int] = None
+    OriginalPublicationYear: Optional[int] = None  # çoğu sayfada yok; boş kalabilir
+    NumberOfPages: Optional[int] = None
+    Language: Optional[str] = None
+    ISBN: Optional[str] = None
+    ISBN13: Optional[str] = None
+    AverageRating: Optional[float] = None
 
-def _og_image(soup: BeautifulSoup) -> Optional[str]:
-    m = soup.find("meta", property="og:image")
-    return m["content"].strip() if m and m.get("content") else None
+    def to_notion_payload_dict(self) -> Dict[str, Any]:
+        """
+        Notion mapping adları (kolon başlıkları) ile aynı anahtarlar.
+        """
+        return {
+            "goodreadsURL": self.goodreadsURL,
+            "Book Id": self.BookId,
+            "Title": self.Title,
+            "Cover URL": self.CoverURL,
+            "Author": self.Author,
+            "Additional Authors": self.AdditionalAuthors,
+            "Publisher": self.Publisher,
+            "Year Published": self.YearPublished,
+            "Original Publication Year": self.OriginalPublicationYear,
+            "Number of Pages": self.NumberOfPages,
+            "Language": self.Language,
+            "ISBN": self.ISBN,
+            "ISBN13": self.ISBN13,
+            "Average Rating": self.AverageRating,
+        }
 
-def _row_value_by_label(soup: BeautifulSoup, label_keyword: str) -> Optional[str]:
-    """BookDetails satırlarında label'a göre değeri bul."""
-    rows = soup.select(".BookDetails .BookDetails__row")
-    for row in rows:
-        lab = row.select_one(".BookDetails__label")
-        if not lab:
-            continue
-        if label_keyword.lower() in lab.get_text(" ", strip=True).lower():
-            val = row.select_one(".BookDetails__description") or row
-            return _clean(val.get_text(" ", strip=True))
-    # fallback – eski tasarımda metin araması
-    cand = soup.find(string=re.compile(label_keyword, re.I))
-    if cand:
-        return _clean(cand.find_parent().get_text(" ", strip=True))
+
+def _clean(txt: Optional[str]) -> Optional[str]:
+    if not txt:
+        return None
+    t = " ".join(txt.split())
+    return t or None
+
+
+def _first_str(x) -> Optional[str]:
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict) and "name" in x:
+        return x.get("name")
+    if isinstance(x, list) and x:
+        # list of dict/str
+        if isinstance(x[0], dict):
+            return x[0].get("name")
+        if isinstance(x[0], str):
+            return x[0]
     return None
 
-def _publisher_from_published(text: str) -> Optional[str]:
-    if not text: return None
-    pub = ""
-    if " by " in text: pub = text.split(" by ")[-1]
-    elif "by" in text: pub = text.split("by")[-1]
-    pub = _clean(pub)
-    if not pub or any(ch.isdigit() for ch in pub): return None
-    return pub
 
-def fetch_goodreads(url: str, ua: Optional[str] = None, timeout: int = 25) -> Dict[str, Optional[str]]:
-    headers = {"User-Agent": _ua(ua), "Accept-Language": "en-US,en;q=0.8,tr;q=0.7"}
-    r = requests.get(url.strip(), headers=headers, timeout=timeout, allow_redirects=True)
-    if r.status_code in (403, 503):
-        time.sleep(1.0)
-        r = requests.get(url.strip(), headers=headers, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
+def _extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
+    candidates: List[Dict[str, Any]] = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or tag.text or "{}")
+            if isinstance(data, dict):
+                candidates.append(data)
+            elif isinstance(data, list):
+                candidates.extend([d for d in data if isinstance(d, dict)])
+        except Exception:
+            continue
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    # Book nesnesini seç
+    for d in candidates:
+        t = d.get("@type")
+        if t == "Book" or (isinstance(t, list) and "Book" in t):
+            return d
+    return {}
 
-    # başlık & yazar
-    title  = _sel_text(soup, "h1[data-testid='bookTitle']") or _sel_text(soup, "#bookTitle")
-    author = (_sel_text(soup, "a.ContributorLink__name") or
-              _sel_text(soup, "span.AuthorName__name") or
-              _sel_text(soup, "a.authorName span"))
 
-    # Published satırından – yayınevi & yıl
-    published = _row_value_by_label(soup, "Published") or ""
-    publisher = _publisher_from_published(published)
-    year_pub  = _int_year(published)
+def _extract_og(soup: BeautifulSoup, prop: str) -> Optional[str]:
+    tag = soup.find("meta", attrs={"property": prop}) or soup.find(
+        "meta", attrs={"name": prop}
+    )
+    return _clean(tag["content"]) if tag and tag.has_attr("content") else None
 
-    # sayfa sayısı
-    pages = (_row_value_by_label(soup, "pages") or
-             _sel_text(soup, "[data-testid='pagesFormat']"))
-    pages_n = _only_int(pages)
 
-    # dil
-    language = _row_value_by_label(soup, "Edition language")
+def _book_id_from_url(url: str) -> Optional[int]:
+    m = GOODREADS_BOOK_ID_RE.search(url)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
 
-    # ISBN13 / ISBN
-    isbn13_block = _row_value_by_label(soup, "ISBN13") or ""
-    m13 = re.search(r"(97(8|9))\d{10}", isbn13_block.replace("-", ""))
-    isbn13 = m13.group(0) if m13 else None
 
-    isbn_block = _row_value_by_label(soup, "ISBN") or ""
-    m10 = re.search(r"\b(\d{9}[\dXx])\b", isbn_block.replace("-", ""))
-    isbn = m10.group(1).upper() if m10 else None
+def scrape_goodreads(url: str) -> BookData:
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": _ua(), "Accept-Language": "en-US,en;q=0.8,tr;q=0.7"})
+    resp = sess.get(url, timeout=30)
+    resp.raise_for_status()
 
-    # ortalama puan
-    rating = _sel_text(soup, "[data-testid='rating']") or _sel_text(soup, "span[itemprop='ratingValue']")
+    final_url = resp.url  # olası yönlendirme sonrası
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    jsonld = _extract_jsonld(soup)
+
+    # ---- temel alanlar
+    title = _clean(jsonld.get("name"))
+    if not title:
+        # og:title çoğu zaman "Title by Author — Goodreads" biçiminde
+        ogt = _extract_og(soup, "og:title")
+        if ogt and " by " in ogt:
+            title = _clean(ogt.split(" by ", 1)[0])
+        else:
+            title = _clean(ogt)
+
+    author = _first_str(jsonld.get("author"))
+    author = _clean(author)
+
+    cover = _extract_og(soup, "og:image")
+
+    publisher = _first_str(jsonld.get("publisher"))
+    publisher = _clean(publisher)
+
+    # Tarihler
+    year_published = None
+    dp = _first_str(jsonld.get("datePublished"))
+    if dp:
+        # YYYY veya YYYY-MM-DD gelebilir
+        m = re.search(r"\d{4}", dp)
+        if m:
+            year_published = int(m.group(0))
+
+    # JSON-LD’de genelde originalPublicationYear yok;
+    # bulabilirsek doldururuz, yoksa None kalsın.
+    original_year = None
+
+    # Sayfa sayısı
+    pages = None
     try:
-        avg_rating = float(rating.replace(",", ".")) if rating else None
+        pages = int(str(jsonld.get("numberOfPages")).strip()) if jsonld.get("numberOfPages") else None
     except Exception:
-        avg_rating = None
+        pages = None
 
-    # kapak
-    cover = _og_image(soup) or None
-    if not cover:
-        img = soup.select_one("[data-testid='coverImage'] img") or soup.select_one("img.BookCover__image")
-        if img and img.get("src"): cover = img["src"]
+    language = _first_str(jsonld.get("inLanguage"))
+    language = _clean(language)
 
-    # book id
-    book_id = None
-    m_id = re.search(r"/book/show/(\d+)", r.url)
-    if m_id: book_id = int(m_id.group(1))
+    isbn = _first_str(jsonld.get("isbn"))
+    isbn = _clean(isbn)
+    isbn13 = None
+    if isbn:
+        if len(re.sub(r"[^0-9Xx]", "", isbn)) == 13:
+            isbn13 = isbn
+            isbn = None
+        elif len(re.sub(r"[^0-9Xx]", "", isbn)) == 10:
+            # ISBN10 ise olduğu gibi ISBN alanına
+            pass
+        else:
+            # biçimlenmiş/bozuksa rich_text’e aynen geçer
+            pass
 
-    return {
-        "Title": title or None,
-        "Author": author or None,
-        "Additional Authors": None,
-        "Publisher": publisher,
-        "Year Published": year_pub,
-        "Original Publication Year": None,
-        "Number of Pages": pages_n,
-        "Language": language,
-        "ISBN": isbn,
-        "ISBN13": isbn13,
-        "Average Rating": avg_rating,
-        "coverURL": cover,
-        "Book Id": book_id,
-        "goodreadsURL": r.url,
-    }
+    rating = None
+    agg = jsonld.get("aggregateRating") or {}
+    if isinstance(agg, dict):
+        rv = agg.get("ratingValue")
+        try:
+            rating = float(rv)
+        except Exception:
+            rating = None
+
+    # Book Id URL’den
+    book_id = _book_id_from_url(final_url) or _book_id_from_url(url)
+
+    data = BookData(
+        goodreadsURL=final_url,
+        BookId=book_id,
+        Title=title,
+        CoverURL=cover,
+        Author=author,
+        AdditionalAuthors=None,
+        Publisher=publisher,
+        YearPublished=year_published,
+        OriginalPublicationYear=original_year,
+        NumberOfPages=pages,
+        Language=language,
+        ISBN=isbn,
+        ISBN13=isbn13,
+        AverageRating=rating,
+    )
+    return data
+
+
+if __name__ == "__main__":
+    import sys
+    u = sys.argv[1] if len(sys.argv) > 1 else "https://www.goodreads.com/book/show/13038020"
+    bd = scrape_goodreads(u)
+    print(json.dumps(bd.to_notion_payload_dict(), ensure_ascii=False, indent=2))

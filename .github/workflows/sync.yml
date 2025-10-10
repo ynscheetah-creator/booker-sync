@@ -1,34 +1,48 @@
 name: Sync Notion (Books)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manuel çalıştırma butonu
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"  # Her 6 saatte bir (00:00, 06:00, 12:00, 18:00 UTC)
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install deps
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install dependencies
         run: |
-          python -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
 
-# sync.yml - İsteğe bağlı zaman aralığı ayarlayın
-- name: Run sync
-  env:
-    NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-    NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-    RECENT_EDIT_HOURS: 6  # Son 6 saat (varsayılan)
-  run: |
-    source .venv/bin/activate
-    python main.py
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          RECENT_EDIT_HOURS: 24
+        run: |
+          source .venv/bin/activate
+          python main.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-logs-${{ github.run_id }}
+          path: |
+            *.log
+            *.txt
+          retention-days: 7

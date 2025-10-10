@@ -1,6 +1,16 @@
-requests
-beautifulsoup4
-lxml
-html5lib
-notion-client
-python-dotenv
+# notion_sync.py üst kısım
+import os
+from typing import Dict, Any, Optional
+from notion_client import Client
+from utils import get_env, as_title, as_rich, as_url, as_number, truncate
+import re
+
+# Selenium scraper'ı dene, yoksa normal scraper kullan
+try:
+    from goodreads_scraper_selenium import fetch_goodreads_selenium as fetch_goodreads
+    print("✅ Using Selenium scraper")
+except ImportError:
+    from goodreads_scraper import fetch_goodreads
+    print("⚠️  Using basic scraper (install selenium for better results)")
+
+# ... (geri kalan kod aynı)

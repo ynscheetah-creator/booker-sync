@@ -1,6 +1,3 @@
-Elbette, konuştuğumuz tüm geliştirmeleri, düzeltmeleri ve en son istediğiniz değişiklikleri (belirli sütunların hariç tutulması) içeren `notion_sync.py` dosyasının son ve tam halini aşağıda bulabilirsiniz.
-
-```python
 # notion_sync.py
 import os
 from typing import Dict, Any, Optional

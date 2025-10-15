@@ -1,23 +1,29 @@
-name: Sync Notion (Books)
+name: Notion Booker Sync
 
 on:
-  workflow_dispatch:  # Manuel çalıştırma butonu
+  # 1. Zamanlanmış Görev: Her 6 saatte bir otomatik çalıştır (isteğe bağlı)
   schedule:
-    - cron: "0 */6 * * *"  # Her 6 saatte bir (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+
+  # 2. Manuel Tetikleme: GitHub Actions arayüzünden elle çalıştırma
+  workflow_dispatch:
+    inputs:
+      scan_limit:
+        description: 'Taranacak son sayfa sayısı (boş bırakılırsa hepsi taranır)'
+        required: false
+        default: '' # Boş bırakıldığında script tümünü tarar
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: '3.10' # Kullandığınız Python sürümünü yazın
 
       - name: Create virtual environment
         run: python -m venv .venv
@@ -25,24 +31,17 @@ jobs:
       - name: Install dependencies
         run: |
           source .venv/bin/activate
-          pip install --upgrade pip
           pip install -r requirements.txt
-
+      
       - name: Run sync
+        # Bu adım, script'i çalıştırır.
+        # GitHub Secrets'tan ve manuel input'tan gelen değerleri ortam değişkeni olarak ayarlar.
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          RECENT_EDIT_HOURS: 24
+          RECENT_EDIT_HOURS: ${{ secrets.RECENT_EDIT_HOURS || '24' }}
+          # YENİ: Manuel input'tan gelen değeri SCAN_LIMIT değişkenine ata
+          SCAN_LIMIT: ${{ github.event.inputs.scan_limit }}
         run: |
           source .venv/bin/activate
           python main.py
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: error-logs-${{ github.run_id }}
-          path: |
-            *.log
-            *.txt
-          retention-days: 7

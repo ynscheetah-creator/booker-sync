@@ -16,6 +16,8 @@ import logging
 NOTION_TOKEN = get_env("NOTION_TOKEN")
 DATABASE_ID = get_env("NOTION_DATABASE_ID")
 RECENT_EDIT_HOURS = int(get_env("RECENT_EDIT_HOURS", "24"))
+# YENİ: Taranacak maksimum sayfa sayısı (isteğe bağlı)
+SCAN_LIMIT = get_env("SCAN_LIMIT")
 
 # --- INITIALIZATION ---
 if not NOTION_TOKEN or not DATABASE_ID:
@@ -57,7 +59,6 @@ def _was_recently_edited(page: Dict[str, Any]) -> bool:
 
 def _needs_update(props: Dict[str, Any]) -> bool:
     """Bu sayfa güncellenmeye ihtiyaç duyuyor mu?"""
-    # Eğer bu temel alanlardan herhangi biri boşsa güncelleme gerekir.
     required_fields = ["Author", "Cover URL", "Number of Pages", "Year Published", "Publisher"]
     return any(not _get_prop_value(props.get(field)) for field in required_fields)
 
@@ -78,29 +79,24 @@ def fetch_book_data_pipeline(
     """Veri çekme akışını yönetir: Goodreads -> API'ler."""
     goodreads_data, api_data = {}, {}
 
-    # 1. Öncelik: Goodreads (en doğru kaynak)
     if goodreads_url:
         try:
             goodreads_data = fetch_goodreads(goodreads_url)
         except Exception as e:
             logging.warning(f"  ⚠️ Goodreads scraper hatası: {e}")
 
-    # 2. Zenginleştirme/Yedek: API'ler
     search_title = goodreads_data.get("Title") or title
     search_author = goodreads_data.get("Author") or author
     search_isbn = goodreads_data.get("ISBN13") or goodreads_data.get("ISBN") or isbn
 
     try:
         if search_isbn:
-            api_data = fetch_from_google_books(isbn=search_isbn) or \
-                       fetch_from_openlibrary(isbn=search_isbn)
+            api_data = fetch_from_google_books(isbn=search_isbn) or fetch_from_openlibrary(isbn=search_isbn)
         elif search_title:
-            api_data = fetch_from_google_books(title=search_title, author=search_author) or \
-                       fetch_from_openlibrary(title=search_title, author=search_author)
+            api_data = fetch_from_google_books(title=search_title, author=search_author) or fetch_from_openlibrary(title=search_title, author=search_author)
     except Exception as e:
         logging.warning(f"  ⚠️ API arama hatası: {e}")
 
-    # 3. Birleştirme (Goodreads öncelikli)
     final_data = _merge_book_data(goodreads_data, api_data)
     if not final_data:
         logging.warning("  ⚠️ Hiçbir kaynaktan veri bulunamadı.")
@@ -110,20 +106,14 @@ def fetch_book_data_pipeline(
 def _build_updates(
     scraped: Dict[str, Optional[str]], existing_props: Dict[str, Any], force: bool
 ) -> Dict[str, Any]:
-    """Kod tekrarı olmadan Notion güncelleme gövdesini oluşturur."""
+    """Notion güncelleme gövdesini oluşturur."""
     updates = {}
-    # Sadece sizin kullandığınız alanları içeren property map
     prop_map = {
-        "Title": ("Title", as_title),
-        "Author": ("Author", as_multi_select),
-        "Translator": ("Translator", as_multi_select),
-        "goodreadsURL": ("goodreadsURL", as_url),
-        "Cover URL": ("Cover URL", as_url),
-        "Publisher": ("Publisher", as_rich),
-        "Year Published": ("Year Published", as_number),
-        "Original Publication Year": ("Original Publication Year", as_number),
-        "Number of Pages": ("Number of Pages", as_number),
-        "Description": ("Description", as_rich),
+        "Title": ("Title", as_title), "Author": ("Author", as_multi_select),
+        "Translator": ("Translator", as_multi_select), "goodreadsURL": ("goodreadsURL", as_url),
+        "Cover URL": ("Cover URL", as_url), "Publisher": ("Publisher", as_rich),
+        "Year Published": ("Year Published", as_number), "Original Publication Year": ("Original Publication Year", as_number),
+        "Number of Pages": ("Number of Pages", as_number), "Description": ("Description", as_rich),
         "Language": ("Language", as_rich),
     }
 
@@ -135,7 +125,6 @@ def _build_updates(
             if formatted_value:
                 updates[prop_name] = formatted_value
     
-    # ISBN için özel kontrol
     existing_isbn = _get_prop_value(existing_props.get("ISBN"))
     isbn_val = scraped.get("ISBN13") or scraped.get("ISBN")
     if isbn_val and (force or not existing_isbn):
@@ -155,21 +144,50 @@ def _update_page_cover(page_id: str, cover_url: Optional[str]):
 def run_once():
     """Notion veritabanını tarar ve eksik bilgileri tamamlar."""
     logging.info("🚀 Akıllı Senkronizasyon Başlatılıyor...")
-    logging.info(f"🔄 Son {RECENT_EDIT_HOURS} saatte düzenlenenler tamamen güncellenecek.")
-    
+
+    # YENİ: Notion'a her zaman en son eklenenden başlamasını söyle
+    sorts = [{"timestamp": "created_time", "direction": "descending"}]
+    limit = int(SCAN_LIMIT) if SCAN_LIMIT and SCAN_LIMIT.isdigit() else None
+
+    if limit and limit > 0:
+        logging.info(f"🔄 Sadece en son eklenen {limit} sayfa taranacak.")
+    else:
+        logging.info("🔄 Veritabanındaki tüm sayfalar taranacak (en yeniden eskiye).")
+
     all_pages = []
     start_cursor = None
+    
     while True:
+        # Limite ulaştıysak döngüyü kır
+        if limit and len(all_pages) >= limit:
+            break
+
+        # Bir sonraki istek için sayfa boyutunu ayarla
+        page_size = 100
+        if limit:
+            remaining = limit - len(all_pages)
+            if remaining < 100:
+                page_size = remaining
+
         try:
-            response = notion.databases.query(database_id=DATABASE_ID, start_cursor=start_cursor, page_size=100)
-            all_pages.extend(response["results"])
-            if not response["has_more"]: break
-            start_cursor = response["next_cursor"]
+            response = notion.databases.query(
+                database_id=DATABASE_ID,
+                sorts=sorts,
+                start_cursor=start_cursor,
+                page_size=page_size
+            )
+            results = response.get("results", [])
+            all_pages.extend(results)
+
+            if not response.get("has_more") or not results:
+                break # Çekilecek sayfa kalmadı
+
+            start_cursor = response.get("next_cursor")
         except Exception as e:
             logging.error(f"❌ Notion veritabanı okunurken hata oluştu: {e}")
-            return # Programı durdur
+            return
 
-    logging.info(f"📚 Notion'da {len(all_pages)} sayfa bulundu.\n")
+    logging.info(f"📚 Notion'dan {len(all_pages)} sayfa tarandı.\n")
 
     for idx, page in enumerate(all_pages, 1):
         props = page.get("properties", {})
@@ -202,7 +220,6 @@ def run_once():
             logging.warning("  -> Veri bulunamadı, atlanıyor.\n")
             continue
 
-        # Scraper başarısız olur ve başlık bulamazsa, işlem yapmayı engelle
         if not scraped_data.get("Title") and not title:
             logging.warning("  -> Başlık bulunamadığı için bu sayfa atlanıyor.\n")
             continue
@@ -213,8 +230,6 @@ def run_once():
             logging.info("  -> Eklenecek yeni bilgi yok.\n")
             continue
             
-        # Eğer bir güncelleme yapılacaksa ve bu güncellemede 'Title' yoksa,
-        # Notion'un hata vermemesi için mevcut 'Title' bilgisini ekle.
         if "Title" not in updates:
             existing_title_prop = props.get("Title")
             if existing_title_prop:
@@ -224,16 +239,14 @@ def run_once():
             notion.pages.update(page_id=page_id, properties=updates)
             logging.info(f"  ✅ Notion güncellendi: {', '.join(updates.keys())}")
 
-            # Kapak fotoğrafını da güncelle
             existing_cover = page.get("cover")
             if scraped_data.get("Cover URL") and (force_update or not existing_cover):
                 _update_page_cover(page_id, scraped_data.get("Cover URL"))
             
-            print() # Estetik için bir boşluk
+            print()
         except Exception as e:
             logging.error(f"  ❌ Notion güncelleme hatası: {e}\n")
     
     logging.info("=" * 50)
     logging.info("✅ Akıllı Senkronizasyon Tamamlandı!")
     logging.info("=" * 50)
-```

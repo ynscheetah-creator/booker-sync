@@ -1,3 +1,6 @@
+Elbette, konuştuğumuz tüm geliştirmeleri, düzeltmeleri ve en son istediğiniz değişiklikleri (belirli sütunların hariç tutulması) içeren `notion_sync.py` dosyasının son ve tam halini aşağıda bulabilirsiniz.
+
+```python
 # notion_sync.py
 import os
 from typing import Dict, Any, Optional
@@ -202,6 +205,11 @@ def run_once():
             logging.warning("  -> Veri bulunamadı, atlanıyor.\n")
             continue
 
+        # Scraper başarısız olur ve başlık bulamazsa, işlem yapmayı engelle
+        if not scraped_data.get("Title") and not title:
+            logging.warning("  -> Başlık bulunamadığı için bu sayfa atlanıyor.\n")
+            continue
+
         updates = _build_updates(scraped_data, props, force=force_update)
 
         if not updates:
@@ -231,3 +239,4 @@ def run_once():
     logging.info("=" * 50)
     logging.info("✅ Akıllı Senkronizasyon Tamamlandı!")
     logging.info("=" * 50)
+```

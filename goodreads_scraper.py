@@ -78,16 +78,13 @@ def _extract_from_json_ld(soup: BeautifulSoup) -> Dict[str, Optional[str]]:
     return data
 
 def fetch_goodreads(url: str) -> Dict[str, Optional[str]]:
-    """Fetches essential fields from a Goodreads book page with updated selectors."""
+    # ... (fonksiyonun başı)
     
-    # YENİ: URL'yi gereksiz parametrelerden temizle
-    clean_url = _sanitize_url(url)
-    logging.info(f"  🔍 Goodreads'ten çekiliyor: {clean_url}")
-    time.sleep(1.5)
-
     try:
         res = requests.get(clean_url, headers=HEADERS, timeout=30)
         res.raise_for_status()
+        # YENİ: Karakter kodlamasını UTF-8 olmaya zorla
+        res.encoding = 'utf-8' 
     except Exception as e:
         logging.error(f"  ❌ Goodreads isteği başarısız: {e}")
         raise

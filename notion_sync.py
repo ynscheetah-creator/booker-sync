@@ -24,20 +24,29 @@ notion = Client(auth=NOTION_TOKEN)
 
 # --- HELPER FUNCTIONS ---
 def _get_prop_value(p: Dict[str, Any]) -> Optional[str]:
-    # ... (Bu fonksiyon değişmedi, aynı kalabilir)
+    """Mevcut sayfadaki property'yi string olarak çek."""
     if p is None: return None
-    t = p["type"]
+    t = p.get("type")
     try:
-        if t == "title": return "".join([x["plain_text"] for x in p["title"]])
-        if t == "rich_text": return "".join([x["plain_text"] for x in p["rich_text"]])
-        if t == "url": return p["url"]
-        if t == "number": return str(p["number"])
-        if t == "multi_select": return ", ".join([x["name"] for x in p["multi_select"]])
+        if t == "title":
+            arr = p.get("title", [])
+            return "".join([x.get("plain_text", "") for x in arr]) if arr else None
+        if t == "rich_text":
+            arr = p.get("rich_text", [])
+            return "".join([x.get("plain_text", "") for x in arr]) if arr else None
+        if t == "url":
+            return p.get("url")
+        if t == "number":
+            return str(p.get("number")) if p.get("number") is not None else None
+        if t == "multi_select":
+            arr = p.get("multi_select", [])
+            return ", ".join([x.get("name", "") for x in arr]) if arr else None
     except (KeyError, IndexError):
         return None
     return None
 
 def _was_recently_edited(page: Dict[str, Any]) -> bool:
+    """Sayfa son X saat içinde düzenlendi mi?"""
     try:
         last_edited = page.get("last_edited_time")
         if not last_edited: return False
@@ -47,8 +56,9 @@ def _was_recently_edited(page: Dict[str, Any]) -> bool:
         return False
 
 def _needs_update(props: Dict[str, Any]) -> bool:
-    # Eğer bu alanlardan herhangi biri boşsa güncelleme gerekir.
-    required_fields = ["Author", "Cover URL", "Number of Pages", "Year Published"]
+    """Bu sayfa güncellenmeye ihtiyaç duyuyor mu?"""
+    # Eğer bu temel alanlardan herhangi biri boşsa güncelleme gerekir.
+    required_fields = ["Author", "Cover URL", "Number of Pages", "Year Published", "Publisher"]
     return any(not _get_prop_value(props.get(field)) for field in required_fields)
 
 def _merge_book_data(*sources: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
@@ -102,19 +112,28 @@ def _build_updates(
 ) -> Dict[str, Any]:
     """Kod tekrarı olmadan Notion güncelleme gövdesini oluşturur."""
     updates = {}
+    # Sadece sizin kullandığınız alanları içeren property map
     prop_map = {
-        "Title": ("Title", as_title), "Author": ("Author", as_multi_select),
-        "Cover URL": ("Cover URL", as_url), "Publisher": ("Publisher", as_rich),
-        "Year Published": ("Year Published", as_number), "Number of Pages": ("Number of Pages", as_number),
-        "Average Rating": ("Average Rating", as_number), "Description": ("Description", as_rich),
-        "Series": ("Series", as_rich), "Genres": ("Genres", as_multi_select),
+        "Title": ("Title", as_title),
+        "Author": ("Author", as_multi_select),
+        "Translator": ("Translator", as_multi_select),
+        "goodreadsURL": ("goodreadsURL", as_url),
+        "Cover URL": ("Cover URL", as_url),
+        "Publisher": ("Publisher", as_rich),
+        "Year Published": ("Year Published", as_number),
+        "Original Publication Year": ("Original Publication Year", as_number),
+        "Number of Pages": ("Number of Pages", as_number),
+        "Description": ("Description", as_rich),
+        "Language": ("Language", as_rich),
     }
 
     for prop_name, (scraped_key, formatter) in prop_map.items():
         existing_val = _get_prop_value(existing_props.get(prop_name))
         scraped_val = scraped.get(scraped_key)
         if scraped_val and (force or not existing_val):
-            updates[prop_name] = formatter(scraped_val)
+            formatted_value = formatter(scraped_val)
+            if formatted_value:
+                updates[prop_name] = formatted_value
     
     # ISBN için özel kontrol
     existing_isbn = _get_prop_value(existing_props.get("ISBN"))
@@ -138,15 +157,17 @@ def run_once():
     logging.info("🚀 Akıllı Senkronizasyon Başlatılıyor...")
     logging.info(f"🔄 Son {RECENT_EDIT_HOURS} saatte düzenlenenler tamamen güncellenecek.")
     
-    # Şimdilik basitlik adına tüm veritabanını çekiyoruz.
-    # Büyük veritabanları için Notion'un 'filter' özelliği kullanılabilir.
     all_pages = []
     start_cursor = None
     while True:
-        response = notion.databases.query(database_id=DATABASE_ID, start_cursor=start_cursor, page_size=100)
-        all_pages.extend(response["results"])
-        if not response["has_more"]: break
-        start_cursor = response["next_cursor"]
+        try:
+            response = notion.databases.query(database_id=DATABASE_ID, start_cursor=start_cursor, page_size=100)
+            all_pages.extend(response["results"])
+            if not response["has_more"]: break
+            start_cursor = response["next_cursor"]
+        except Exception as e:
+            logging.error(f"❌ Notion veritabanı okunurken hata oluştu: {e}")
+            return # Programı durdur
 
     logging.info(f"📚 Notion'da {len(all_pages)} sayfa bulundu.\n")
 
@@ -186,6 +207,13 @@ def run_once():
         if not updates:
             logging.info("  -> Eklenecek yeni bilgi yok.\n")
             continue
+            
+        # Eğer bir güncelleme yapılacaksa ve bu güncellemede 'Title' yoksa,
+        # Notion'un hata vermemesi için mevcut 'Title' bilgisini ekle.
+        if "Title" not in updates:
+            existing_title_prop = props.get("Title")
+            if existing_title_prop:
+                updates["Title"] = existing_title_prop
 
         try:
             notion.pages.update(page_id=page_id, properties=updates)

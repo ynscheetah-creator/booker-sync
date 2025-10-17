@@ -15,7 +15,6 @@ import logging
 NOTION_TOKEN = get_env("NOTION_TOKEN")
 DATABASE_ID = get_env("NOTION_DATABASE_ID")
 NEW_ENTRY_HOURS = int(get_env("NEW_ENTRY_HOURS", "24"))
-RECENT_EDIT_HOURS = int(get_env("RECENT_EDIT_HOURS", "24"))
 SCAN_LIMIT = get_env("SCAN_LIMIT")
 
 # --- INITIALIZATION ---
@@ -39,21 +38,13 @@ def _get_prop_value(p: Dict[str, Any]) -> Optional[str]:
         if t == "multi_select":
             arr = p.get("multi_select", [])
             return ", ".join([x.get("name", "") for x in arr]) if arr else None
+        if t == "checkbox": # Checkbox değerini okumak için
+            return p.get("checkbox", False)
     except (KeyError, IndexError):
         return None
     return None
 
-def _was_recently_edited(page: Dict[str, Any]) -> bool:
-    try:
-        last_edited = page.get("last_edited_time")
-        if not last_edited: return False
-        edited_time = datetime.fromisoformat(last_edited.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - edited_time) < timedelta(hours=RECENT_EDIT_HOURS)
-    except Exception:
-        return False
-
 def _was_recently_created(page: Dict[str, Any]) -> bool:
-    """Sayfa son X saat içinde oluşturuldu mu?"""
     try:
         created_time_str = page.get("created_time")
         if not created_time_str: return False
@@ -61,35 +52,6 @@ def _was_recently_created(page: Dict[str, Any]) -> bool:
         return (datetime.now(timezone.utc) - created_time) < timedelta(hours=NEW_ENTRY_HOURS)
     except Exception:
         return False
-
-def _needs_enrichment(props: Dict[str, Any]) -> bool:
-    """
-    Sayfanın zenginleştirilmeye ihtiyacı olup olmadığını kontrol eder.
-    Eğer temel alanlar (ISBN/Title/Goodreads URL) varsa ama 
-    zenginleştirme alanları boşsa, kullanıcı muhtemelen ISBN eklemiş/değiştirmiştir.
-    """
-    # Temel alanlardan en az biri var mı?
-    has_isbn = bool(_get_prop_value(props.get("ISBN")))
-    has_title = bool(_get_prop_value(props.get("Title")))
-    has_goodreads = bool(_get_prop_value(props.get("goodreadsURL")))
-    
-    if not (has_isbn or has_goodreads or has_title):
-        return False
-    
-    # Zenginleştirme alanları kontrolü
-    enrichment_fields = [
-        "Cover URL", "Description", "Publisher", 
-        "Number of Pages", "Year Published", "Author"
-    ]
-    
-    empty_count = sum(
-        1 for field in enrichment_fields 
-        if not _get_prop_value(props.get(field))
-    )
-    
-    # En az 4/6 zenginleştirme alanı boşsa, zenginleştirme gerekli
-    # Bu, kullanıcının yeni bir ISBN eklediği anlamına gelir
-    return empty_count >= 4
 
 def _merge_book_data(*sources: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
     merged = {}
@@ -126,8 +88,9 @@ def fetch_book_data_pipeline(
     return final_data
 
 # --- NOTION UPDATE LOGIC ---
-def _build_updates(scraped: Dict[str, Optional[str]]) -> Dict[str, Any]:
-    """Tüm alanları Notion formatına çevirir."""
+def _build_updates(
+    scraped: Dict[str, Optional[str]]
+) -> Dict[str, Any]:
     updates = {}
     prop_map = {
         "Title": ("Title", as_title), "Author": ("Author", as_multi_select),
@@ -159,25 +122,31 @@ def _update_page_cover(page_id: str, cover_url: Optional[str]):
 
 # --- MAIN RUNNER ---
 def run_once():
-    """
-    Notion'daki sadece şu kayıtları işler:
-    1. Yeni eklenen kayıtlar (son X saat içinde oluşturulmuş)
-    2. ISBN eklenmiş/değiştirilmiş ama zenginleştirme alanları boş olan kayıtlar
-    """
-    logging.info("🚀 Akıllı ISBN Bazlı Senkronizasyon Başlatılıyor...")
-    logging.info("📋 Sadece YENİ kayıtlar veya ISBN güncellenmiş kayıtlar işlenecek.\n")
-    
+    """Notion'daki sadece YENİ veya 'Refresh Data' İŞARETLİ kayıtları işler."""
+    logging.info("🚀 Akıllı Senkronizasyon Başlatılıyor...")
+    # FİLTRE: Sadece yeni veya işaretli olanları Notion'dan çek
+    db_filter = {
+        "or": [
+            {
+                "timestamp": "created_time",
+                "created_time": {
+                    "past_hours": NEW_ENTRY_HOURS
+                }
+            },
+            {
+                "property": "Refresh Data", # Değişiklik
+                "checkbox": {
+                    "equals": True
+                }
+            }
+        ]
+    }
+
     sorts = [{"timestamp": "created_time", "direction": "descending"}]
     limit = int(SCAN_LIMIT) if SCAN_LIMIT and SCAN_LIMIT.isdigit() else None
     
-    if limit and limit > 0:
-        logging.info(f"📄 Sadece en son eklenen/güncellenen {limit} sayfa taranacak.")
-    else:
-        logging.info("📄 Veritabanındaki tüm sayfalar taranacak (en yeniden eskiye).")
-    
     all_pages = []
     start_cursor = None
-    
     while True:
         if limit and len(all_pages) >= limit: break
         page_size = 100
@@ -186,9 +155,10 @@ def run_once():
             if remaining < 100: page_size = remaining
         try:
             response = notion.databases.query(
-                database_id=DATABASE_ID, 
-                sorts=sorts, 
-                start_cursor=start_cursor, 
+                database_id=DATABASE_ID,
+                filter=db_filter,
+                sorts=sorts,
+                start_cursor=start_cursor,
                 page_size=page_size
             )
             results = response.get("results", [])
@@ -199,34 +169,28 @@ def run_once():
             logging.error(f"❌ Notion veritabanı okunurken hata oluştu: {e}")
             return
 
-    logging.info(f"📚 Notion'dan {len(all_pages)} sayfa tarandı.\n")
-    processed_count = 0
-    skipped_count = 0
+    if not all_pages:
+        logging.info("✅ İşlem yapılacak yeni veya işaretlenmiş bir kayıt bulunamadı. Senkronizasyon tamamlandı.")
+        return
+
+    logging.info(f"📚 İşlem yapılacak {len(all_pages)} kayıt bulundu.\n")
 
     for idx, page in enumerate(all_pages, 1):
         props = page.get("properties", {})
         page_id = page["id"]
         
         is_new = _was_recently_created(page)
-        is_edited = _was_recently_edited(page)
-        needs_enrich = _needs_enrichment(props)
+        is_refresh_data = _get_prop_value(props.get("Refresh Data")) # Değişiklik
 
-        # YENİ MANTIK: Sadece yeni VEYA (düzenlenmiş VE zenginleştirmeye ihtiyacı var)
-        if not is_new and not (is_edited and needs_enrich):
-            skipped_count += 1
-            continue
-        
-        processed_count += 1
         title = _get_prop_value(props.get("Title"))
         gr_url = _get_prop_value(props.get("goodreadsURL"))
         display_name = title or gr_url or page_id
         
-        logging.info(f"--- [{processed_count}] 📖: {display_name[:70]} ---")
-        
+        logging.info(f"--- [{idx}/{len(all_pages)}] 📖: {display_name[:70]} ---")
         if is_new:
-            logging.info("  ➡️ YENİ KAYIT - Tüm veriler çekilecek.")
-        elif is_edited and needs_enrich:
-            logging.info("  ➡️ ISBN DEĞİŞTİRİLMİŞ - Zenginleştirme alanları boş, veriler çekilecek.")
+            logging.info("  ➡️ Yeni kayıt bulundu, tüm veriler çekilecek.")
+        elif is_refresh_data:
+            logging.info("  ➡️ 'Refresh Data' işaretli, tüm veriler yeniden çekilecek.") # Değişiklik
 
         scraped_data = fetch_book_data_pipeline(
             title=title,
@@ -249,13 +213,16 @@ def run_once():
             notion.pages.update(page_id=page_id, properties=updates)
             logging.info(f"  ✅ Notion güncellendi: {', '.join(updates.keys())}")
             _update_page_cover(page_id, scraped_data.get("Cover URL"))
+            
+            # Başarılı güncellemeden sonra checkbox'ı temizle
+            if is_refresh_data:
+                notion.pages.update(page_id=page_id, properties={"Refresh Data": {"checkbox": False}}) # Değişiklik
+                logging.info("  ✔️ 'Refresh Data' işareti kaldırıldı.") # Değişiklik
             print()
         except Exception as e:
             logging.error(f"  ❌ Notion güncelleme hatası: {e}\n")
     
-    logging.info("=" * 60)
-    logging.info("✅ Akıllı ISBN Bazlı Senkronizasyon Tamamlandı!")
-    logging.info(f"   📊 Toplam Taranan: {len(all_pages)}")
-    logging.info(f"   ✅ İşlenen: {processed_count}")
-    logging.info(f"   ⏭️  Atlanan: {skipped_count}")
-    logging.info("=" * 60)
+    logging.info("=" * 50)
+    logging.info("✅ Akıllı Senkronizasyon Tamamlandı!")
+    logging.info(f"   İşlem Yapılan Sayfa Sayısı: {len(all_pages)}")
+    logging.info("=" * 50)

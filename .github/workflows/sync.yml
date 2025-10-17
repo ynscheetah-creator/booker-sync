@@ -23,7 +23,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10' # Kullandığınız Python sürümünü yazın
+          python-version: '3.10'
 
       - name: Create virtual environment
         run: python -m venv .venv
@@ -39,8 +39,10 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          # YENİ SATIR: "Yeni" kayıtların kaç saatlik olduğunu belirler.
+          NEW_ENTRY_HOURS: ${{ secrets.NEW_ENTRY_HOURS || '24' }}
           RECENT_EDIT_HOURS: ${{ secrets.RECENT_EDIT_HOURS || '24' }}
-          # YENİ: Manuel input'tan gelen değeri SCAN_LIMIT değişkenine ata
+          # Manuel input'tan gelen değeri SCAN_LIMIT değişkenine ata
           SCAN_LIMIT: ${{ github.event.inputs.scan_limit }}
         run: |
           source .venv/bin/activate

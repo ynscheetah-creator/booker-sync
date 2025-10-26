@@ -1,6 +1,24 @@
-requests>=2.31.0
-   beautifulsoup4>=4.12.0
-   lxml>=4.9.0
-   html5lib>=1.1
-   notion-client>=2.2.1
-   python-dotenv>=1.0.0
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+html5lib==1.1
+notion-client==2.2.1
+python-dotenv==1.0.1
+```
+
+**Kritik değişiklik:** `>=` değil `==` kullanıyoruz!
+
+---
+
+## 📝 Adımlar:
+
+1. **GitHub'da `requirements.txt`** dosyasını açın
+2. **Edit** butonuna tıklayın
+3. Tüm içeriği şununla değiştirin:
+```
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+html5lib==1.1
+notion-client==2.2.1
+python-dotenv==1.0.1

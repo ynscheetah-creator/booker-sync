@@ -31,7 +31,11 @@ jobs:
       - name: Install dependencies
         run: |
           source .venv/bin/activate
-          pip install -r requirements.txt
+          # Cache'i atlayarak ve force reinstall ile yükle
+          pip install --no-cache-dir --force-reinstall -r requirements.txt
+          # Yüklenen notion-client versiyonunu logla
+          echo "📦 Yüklenen notion-client versiyonu:"
+          pip show notion-client
       
       - name: Run sync
         # Bu adım, script'i çalıştırır.
